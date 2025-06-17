@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from transformers import AutoTokenizer
 from model.modeling_llada import LLaDAModelLM
-from generate import generate, generate_with_drs, generate_with_drs_fixed
+from generate import generate, generate_with_drs_fixed
 
 
 def test_drs_basic():
