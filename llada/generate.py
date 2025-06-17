@@ -369,28 +369,18 @@ def allocate_refinement_budget(block_ambiguities, total_refinement_budget):
 
 
 @torch.no_grad()
-def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128,
-                      temperature=0., remasking='low_confidence', mask_id=126336,
-                      threshold=0.8, t_base=8):
+def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_length=128,
+                            temperature=0., remasking='low_confidence', mask_id=126336,
+                            threshold=0.8, t_base=8):
     """
-    Dynamic Refinement Scheduling generation.
+    修正版Dynamic Refinement Scheduling generation.
 
-    Args:
-        model: Mask predictor
-        prompt: Input tensor of shape (1, L)
-        steps: Total computational budget (NFE)
-        gen_length: Generated answer length
-        block_length: Block size for processing
-        temperature: Sampling temperature
-        remasking: Remasking strategy
-        mask_id: Mask token ID (126336)
-        threshold: Confidence threshold for ambiguity calculation
-        t_base: Base denoising steps for initial pass
-
-    Returns:
-        (generated_sequence, total_nfe, ambiguity_scores)
+    主な修正点:
+    1. 再マスキング戦略を削除（安定性向上）
+    2. 真の早期終了を実装（NFE削減）
+    3. 動的予算配分の改善
     """
-    # Initialize sequence with masks
+    # シーケンスをマスクで初期化
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -398,7 +388,7 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
 
-    # Phase 1: Coarse Initial Pass (T_base steps on all blocks)
+    # Phase 1: 初期粗いパス
     block_confidences = []
     nfe = 0
 
@@ -408,7 +398,7 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        # Run T_base steps on current block
+        # T_baseステップを実行
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
@@ -426,99 +416,102 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
             x[transfer_index] = x0[transfer_index]
 
-            # Store confidence scores from the last step of base pass
+            # 最後のステップでブロック信頼度スコアを保存
             if i == t_base - 1:
                 block_confidence_scores = confidence_scores[0,
                                                             current_block_start:current_block_end]
 
-        # Calculate block ambiguity score
+        # ブロック曖昧度スコア計算
         if block_confidence_scores is not None:
             ambiguity_score = calculate_block_ambiguity(
                 block_confidence_scores, threshold, mask_id)
 
-            # デバッグ情報を追加
+            # デバッグ情報
             valid_scores = block_confidence_scores[block_confidence_scores != -np.inf]
+            remaining_masks = (
+                x[:, current_block_start:current_block_end] == mask_id).sum().item()
+
             if len(valid_scores) > 0:
-                print(f"ブロック {num_block}: マスクトークン数={len(valid_scores)}, "
+                print(f"ブロック {num_block}: 残りマスク={remaining_masks}, "
                       f"信頼度範囲=[{valid_scores.min():.3f}, {valid_scores.max():.3f}], "
-                      f"閾値以下={((valid_scores < threshold).sum().item())}/{len(valid_scores)}, "
                       f"曖昧度スコア={ambiguity_score:.3f}")
         else:
             ambiguity_score = 0.0
+
         block_confidences.append(ambiguity_score)
 
-        # 曖昧度スコアが十分に低い場合のみ早期終了
-        # （従来の完全生成チェックは削除）
-
-    # Phase 2: Dynamic Budget Reallocation
+    # Phase 2: 動的予算再配分
     t_used_base = t_base * num_blocks
     t_refine = max(0, steps - t_used_base)
 
     print(f"Phase 2: 予算再配分 - 使用済み: {t_used_base}, 残り予算: {t_refine}")
     print(f"ブロック曖昧度スコア: {block_confidences}")
 
+    # 真の早期終了チェック: 全ブロックが完成済みなら終了
+    total_remaining_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
+    if total_remaining_masks == 0:
+        print(f"早期終了: 全ブロック完成済み - 総NFE: {nfe} (削減: {steps - nfe})")
+        return x, nfe, block_confidences
+
     if t_refine > 0:
-        # Calculate additional steps per block based on ambiguity
+        # 曖昧度に基づく追加ステップ配分
         additional_steps = allocate_refinement_budget(
             block_confidences, t_refine)
         print(f"追加ステップ配分: {additional_steps}")
 
-        # Phase 3: Targeted Refinement
+        # Phase 3: 改善された標的精錬
         for num_block in range(num_blocks):
             if additional_steps[num_block] == 0:
-                continue  # Skip blocks that don't need refinement
+                continue
 
             current_block_start = prompt.shape[1] + num_block * block_length
             current_block_end = current_block_start + block_length
 
+            # ブロック完成チェック
+            block_masks = (
+                x[:, current_block_start:current_block_end] == mask_id).sum().item()
+            if block_masks == 0:
+                print(f"ブロック {num_block}: すでに完成 - スキップ")
+                continue
+
             print(
                 f"ブロック {num_block} の追加精錬中: {additional_steps[num_block]} ステップ")
 
-            # Apply additional refinement steps
+            # 修正: 再マスキングなしの安定した精錬
             for i in range(additional_steps[num_block]):
-                nfe += 1
-
-                # Phase 3の各ステップで低信頼度トークンを再マスク
-                mask_index = (x == mask_id)
-                logits = model(x).logits
-
-                # 現在のブロックの信頼度をチェック
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                current_tokens = x[:, current_block_start:current_block_end]
-                current_confidence = torch.gather(p[:, current_block_start:current_block_end],
-                                                  dim=-1,
-                                                  index=current_tokens.unsqueeze(-1)).squeeze(-1)
-
-                # 低信頼度トークンを再マスク
-                low_confidence_mask = current_confidence < threshold
-                x[:, current_block_start:current_block_end] = torch.where(
-                    low_confidence_mask,
-                    torch.tensor(mask_id, device=x.device),
-                    current_tokens
-                )
-
-                # 再マスクされたトークンがない場合は早期終了
-                if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                    print(f"  ステップ {i+1}: 精錬完了（低信頼度トークンなし）")
+                # ブロック完成チェック（真の早期終了）
+                current_masks = (
+                    x[:, current_block_start:current_block_end] == mask_id).sum().item()
+                if current_masks == 0:
+                    print(f"  ステップ {i+1}: ブロック完成 - 早期終了")
                     break
 
-                # マスクインデックスを更新
+                nfe += 1
                 mask_index = (x == mask_id)
+                logits = model(x).logits
                 mask_index[:, current_block_end:] = 0
 
-                # 1つのトークンを精錬
-                x0, transfer_index, refined_confidence = get_transfer_index_with_confidence(
+                # 標準の転送インデックス使用（再マスキングなし）
+                x0, transfer_index = get_transfer_index(
                     logits, temperature, remasking, mask_index, x,
-                    torch.tensor([[1]], device=x.device))
+                    torch.tensor([[1]], device=x.device), threshold=None)
 
                 x[transfer_index] = x0[transfer_index]
 
-                # 精錬進捗を表示
                 remaining_masks = (
                     x[:, current_block_start:current_block_end] == mask_id).sum().item()
                 print(f"  ステップ {i+1}: 残りマスク={remaining_masks}, NFE={nfe}")
 
-    print(f"DRS生成完了 - 総NFE: {nfe}")
+                # NFE上限チェック
+                if nfe >= steps:
+                    print(f"  NFE上限到達 - 精錬終了")
+                    break
+
+            # 全体的なNFE上限チェック
+            if nfe >= steps:
+                break
+
+    print(f"DRS生成完了 - 総NFE: {nfe}, 削減率: {((steps - nfe) / steps * 100):.1f}%")
     return x, nfe, block_confidences
 
 

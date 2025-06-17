@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from transformers import AutoTokenizer
 from model.modeling_llada import LLaDAModelLM
-from generate import generate, generate_with_drs
+from generate import generate, generate_with_drs, generate_with_drs_fixed
 
 
 def test_drs_basic():
@@ -58,8 +58,8 @@ def test_drs_basic():
         print("DRS生成")
         print("="*50)
 
-        # DRS生成 - より厳しい閾値とより少ないベースステップ
-        drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
+        # DRS生成（修正版） - より厳しい閾値とより少ないベースステップ
+        drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
             model, input_ids, steps=steps, gen_length=gen_length,
             block_length=block_length, temperature=0., threshold=0.9, t_base=4
         )
@@ -140,8 +140,8 @@ def test_drs_multiple_prompts():
             input_ids = tokenizer(prompt_formatted)['input_ids']
             input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-            # DRS生成 - より困難な条件
-            drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
+            # DRS生成（修正版） - より困難な条件
+            drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=96, gen_length=128,
                 block_length=32, temperature=0., threshold=0.9, t_base=4
             )
@@ -209,8 +209,8 @@ def test_drs_ablation():
                 f"\n設定: {config['name']} (t_base={config['t_base']}, threshold={config['threshold']})")
             print("-" * 50)
 
-            # DRS生成 - より困難な条件
-            drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
+            # DRS生成（修正版） - より困難な条件
+            drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=96, gen_length=128,
                 block_length=32, temperature=0.,
                 threshold=config['threshold'], t_base=config['t_base']
