@@ -369,16 +369,28 @@ def allocate_refinement_budget(block_ambiguities, total_refinement_budget):
 
 
 @torch.no_grad()
-def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_length=128,
-                            temperature=0., remasking='low_confidence', mask_id=126336,
-                            threshold=0.8, t_base=8):
+def generate_with_drs_research(model, prompt, steps=128, gen_length=128, block_length=128,
+                               temperature=0., remasking='low_confidence', mask_id=126336,
+                               threshold=0.8, t_base=8):
     """
-    修正版Dynamic Refinement Scheduling generation.
+    研究目的に沿った Dynamic Refinement Scheduling generation.
 
-    主な修正点:
-    1. 再マスキング戦略を削除（安定性向上）
-    2. 真の早期終了を実装（NFE削減）
-    3. 動的予算配分の改善
+    研究の核心:
+    1. 難しいブロックの特定とそこへの計算集中
+    2. 品質を保ちながらNFE削減
+    3. 信頼度スコアに基づく適応的予算配分
+
+    Args:
+        model: LLaDA モデル
+        prompt: 入力プロンプト
+        steps: 総計算予算（NFE上限）
+        gen_length: 生成長
+        block_length: ブロック長
+        temperature: サンプリング温度
+        remasking: 再マスキング戦略
+        mask_id: マスクトークンID
+        threshold: 信頼度閾値（曖昧度計算用）
+        t_base: 初期パスでの各ブロックのステップ数
     """
     # シーケンスをマスクで初期化
     x = torch.full((1, prompt.shape[1] + gen_length),
@@ -388,17 +400,18 @@ def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_leng
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
 
-    # Phase 1: 初期粗いパス
+    # Phase 1: 粗い初期パス（全ブロックに最小限の計算を配分）
     block_confidences = []
+    block_remaining_masks = []
     nfe = 0
 
-    print(f"Phase 1: 初期粗いパス開始 - {t_base}ステップ x {num_blocks}ブロック")
+    print(f"Phase 1: 粗い初期パス - {t_base}ステップ x {num_blocks}ブロック")
 
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        # T_baseステップを実行
+        # 各ブロックでt_baseステップを実行
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
@@ -416,103 +429,148 @@ def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_leng
 
             x[transfer_index] = x0[transfer_index]
 
-            # 最後のステップでブロック信頼度スコアを保存
+            # 最後のステップで信頼度スコアを保存
             if i == t_base - 1:
                 block_confidence_scores = confidence_scores[0,
                                                             current_block_start:current_block_end]
+
+                # 残りマスク数を記録
+                remaining_masks = (
+                    x[:, current_block_start:current_block_end] == mask_id).sum().item()
+                block_remaining_masks.append(remaining_masks)
 
         # ブロック曖昧度スコア計算
         if block_confidence_scores is not None:
             ambiguity_score = calculate_block_ambiguity(
                 block_confidence_scores, threshold, mask_id)
 
-            # デバッグ情報
-            valid_scores = block_confidence_scores[block_confidence_scores != -np.inf]
-            remaining_masks = (
-                x[:, current_block_start:current_block_end] == mask_id).sum().item()
-
-            if len(valid_scores) > 0:
-                print(f"ブロック {num_block}: 残りマスク={remaining_masks}, "
-                      f"信頼度範囲=[{valid_scores.min():.3f}, {valid_scores.max():.3f}], "
-                      f"曖昧度スコア={ambiguity_score:.3f}")
+            # 残りマスクがあるブロックのみ曖昧度を計算（完了ブロックは0）
+            if block_remaining_masks[-1] == 0:
+                ambiguity_score = 0.0
         else:
             ambiguity_score = 0.0
 
         block_confidences.append(ambiguity_score)
 
+        # デバッグ情報
+        valid_scores = block_confidence_scores[block_confidence_scores != -
+                                               np.inf] if block_confidence_scores is not None else []
+        if len(valid_scores) > 0:
+            print(f"ブロック {num_block}: 残りマスク={block_remaining_masks[-1]}, "
+                  f"信頼度範囲=[{valid_scores.min():.3f}, {valid_scores.max():.3f}], "
+                  f"曖昧度スコア={ambiguity_score:.3f}")
+        else:
+            print(f"ブロック {num_block}: 完了済み, 曖昧度スコア=0.0")
+
     # Phase 2: 動的予算再配分
     t_used_base = t_base * num_blocks
     t_refine = max(0, steps - t_used_base)
 
-    print(f"Phase 2: 予算再配分 - 使用済み: {t_used_base}, 残り予算: {t_refine}")
-    print(f"ブロック曖昧度スコア: {block_confidences}")
+    print(f"\nPhase 2: 動的予算再配分")
+    print(f"  使用済み予算: {t_used_base}")
+    print(f"  残り予算: {t_refine}")
+    print(f"  ブロック曖昧度スコア: {block_confidences}")
+    print(f"  ブロック残りマスク数: {block_remaining_masks}")
 
-    # 真の早期終了チェック: 全ブロックが完成済みなら終了
-    total_remaining_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
+    # 早期終了チェック: 全ブロック完成または残り予算なし
+    total_remaining_masks = sum(block_remaining_masks)
     if total_remaining_masks == 0:
-        print(f"早期終了: 全ブロック完成済み - 総NFE: {nfe} (削減: {steps - nfe})")
+        print(f"  → 全ブロック完成済み。早期終了")
+        print(f"  → NFE効率: {nfe}/{steps} = {(nfe/steps*100):.1f}%")
         return x, nfe, block_confidences
 
-    if t_refine > 0:
-        # 曖昧度に基づく追加ステップ配分
-        additional_steps = allocate_refinement_budget(
-            block_confidences, t_refine)
-        print(f"追加ステップ配分: {additional_steps}")
+    if t_refine <= 0:
+        print(f"  → 予算不足。現在の状態で終了")
+        print(f"  → NFE効率: {nfe}/{steps} = {(nfe/steps*100):.1f}%")
+        return x, nfe, block_confidences
 
-        # Phase 3: 改善された標的精錬
-        for num_block in range(num_blocks):
-            if additional_steps[num_block] == 0:
-                continue
+    # 曖昧度に基づく追加ステップ配分
+    additional_steps = allocate_refinement_budget(block_confidences, t_refine)
+    print(f"  → 追加ステップ配分: {additional_steps}")
 
-            current_block_start = prompt.shape[1] + num_block * block_length
-            current_block_end = current_block_start + block_length
+    # Phase 3: 標的精錬（難しいブロックに集中）
+    print(f"\nPhase 3: 標的精錬開始")
 
-            # ブロック完成チェック
-            block_masks = (
+    refined_blocks = 0
+    for num_block in range(num_blocks):
+        if additional_steps[num_block] == 0:
+            continue
+
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        # 既に完成済みブロックはスキップ
+        if block_remaining_masks[num_block] == 0:
+            print(f"  ブロック {num_block}: 既に完成済み - スキップ")
+            continue
+
+        print(f"  ブロック {num_block} 精錬中: {additional_steps[num_block]} ステップ, "
+              f"曖昧度={block_confidences[num_block]:.3f}")
+
+        refined_blocks += 1
+
+        # 追加精錬ステップ実行
+        for i in range(additional_steps[num_block]):
+            # 現在の残りマスクチェック
+            current_masks = (
                 x[:, current_block_start:current_block_end] == mask_id).sum().item()
-            if block_masks == 0:
-                print(f"ブロック {num_block}: すでに完成 - スキップ")
-                continue
-
-            print(
-                f"ブロック {num_block} の追加精錬中: {additional_steps[num_block]} ステップ")
-
-            # 修正: 再マスキングなしの安定した精錬
-            for i in range(additional_steps[num_block]):
-                # ブロック完成チェック（真の早期終了）
-                current_masks = (
-                    x[:, current_block_start:current_block_end] == mask_id).sum().item()
-                if current_masks == 0:
-                    print(f"  ステップ {i+1}: ブロック完成 - 早期終了")
-                    break
-
-                nfe += 1
-                mask_index = (x == mask_id)
-                logits = model(x).logits
-                mask_index[:, current_block_end:] = 0
-
-                # 標準の転送インデックス使用（再マスキングなし）
-                x0, transfer_index = get_transfer_index(
-                    logits, temperature, remasking, mask_index, x,
-                    torch.tensor([[1]], device=x.device), threshold=None)
-
-                x[transfer_index] = x0[transfer_index]
-
-                remaining_masks = (
-                    x[:, current_block_start:current_block_end] == mask_id).sum().item()
-                print(f"  ステップ {i+1}: 残りマスク={remaining_masks}, NFE={nfe}")
-
-                # NFE上限チェック
-                if nfe >= steps:
-                    print(f"  NFE上限到達 - 精錬終了")
-                    break
-
-            # 全体的なNFE上限チェック
-            if nfe >= steps:
+            if current_masks == 0:
+                print(f"    ステップ {i+1}: ブロック完成 - 早期終了")
                 break
 
-    print(f"DRS生成完了 - 総NFE: {nfe}, 削減率: {((steps - nfe) / steps * 100):.1f}%")
+            nfe += 1
+            mask_index = (x == mask_id)
+            logits = model(x).logits
+            mask_index[:, current_block_end:] = 0
+
+            # 残りマスクに応じた転送数決定
+            remaining_mask_count = (
+                mask_index[:, current_block_start:current_block_end]).sum()
+            transfer_count = min(remaining_mask_count,
+                                 max(1, remaining_mask_count // 2))
+
+            x0, transfer_index = get_transfer_index(
+                logits, temperature, remasking, mask_index, x,
+                torch.tensor([[transfer_count]], device=x.device), threshold=None)
+
+            x[transfer_index] = x0[transfer_index]
+
+            # 進捗確認
+            new_masks = (
+                x[:, current_block_start:current_block_end] == mask_id).sum().item()
+            print(
+                f"    ステップ {i+1}: {current_masks} → {new_masks} マスク, NFE={nfe}")
+
+            # NFE上限チェック
+            if nfe >= steps:
+                print(f"    NFE上限到達 - 精錬終了")
+                break
+
+        # 全体的なNFE上限チェック
+        if nfe >= steps:
+            break
+
+    # 最終結果サマリー
+    final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
+    completion_rate = ((gen_length - final_masks) / gen_length) * 100
+
+    print(f"\nDRS生成完了:")
+    print(f"  総NFE: {nfe}/{steps} ({(nfe/steps*100):.1f}%)")
+    print(
+        f"  完成率: {completion_rate:.1f}% ({gen_length - final_masks}/{gen_length})")
+    print(f"  精錬対象ブロック数: {refined_blocks}/{num_blocks}")
+    print(f"  平均曖昧度: {np.mean([c for c in block_confidences if c > 0]):.3f}")
+
     return x, nfe, block_confidences
+
+
+# 後方互換性のため、既存の関数名をエイリアスとして残す
+def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_length=128,
+                            temperature=0., remasking='low_confidence', mask_id=126336,
+                            threshold=0.8, t_base=8):
+    """後方互換性のためのエイリアス - 新しい研究版を呼び出し"""
+    return generate_with_drs_research(model, prompt, steps, gen_length, block_length,
+                                      temperature, remasking, mask_id, threshold, t_base)
 
 
 def main():
