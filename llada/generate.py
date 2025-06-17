@@ -434,6 +434,13 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
         if block_confidence_scores is not None:
             ambiguity_score = calculate_block_ambiguity(
                 block_confidence_scores, threshold, mask_id)
+
+            # デバッグ情報を追加
+            valid_scores = block_confidence_scores[block_confidence_scores != -np.inf]
+            if len(valid_scores) > 0:
+                print(f"ブロック {num_block}: マスクトークン数={len(valid_scores)}, "
+                      f"信頼度範囲=[{valid_scores.min():.3f}, {valid_scores.max():.3f}], "
+                      f"閾値以下={((valid_scores < threshold).sum().item())}/{len(valid_scores)}")
         else:
             ambiguity_score = 0.0
         block_confidences.append(ambiguity_score)
@@ -441,6 +448,7 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
         # Early termination if block is fully generated
         if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
             block_confidences[-1] = 0.0  # No ambiguity if fully generated
+            print(f"ブロック {num_block}: 完全生成により曖昧度スコア=0.0に設定")
 
     # Phase 2: Dynamic Budget Reallocation
     t_used_base = t_base * num_blocks
