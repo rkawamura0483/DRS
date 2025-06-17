@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import os
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
+from tqdm import tqdm
 
 
 def add_gumbel_noise(logits, temperature):
@@ -440,15 +441,14 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
             if len(valid_scores) > 0:
                 print(f"ブロック {num_block}: マスクトークン数={len(valid_scores)}, "
                       f"信頼度範囲=[{valid_scores.min():.3f}, {valid_scores.max():.3f}], "
-                      f"閾値以下={((valid_scores < threshold).sum().item())}/{len(valid_scores)}")
+                      f"閾値以下={((valid_scores < threshold).sum().item())}/{len(valid_scores)}, "
+                      f"曖昧度スコア={ambiguity_score:.3f}")
         else:
             ambiguity_score = 0.0
         block_confidences.append(ambiguity_score)
 
-        # Early termination if block is fully generated
-        if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-            block_confidences[-1] = 0.0  # No ambiguity if fully generated
-            print(f"ブロック {num_block}: 完全生成により曖昧度スコア=0.0に設定")
+        # 曖昧度スコアが十分に低い場合のみ早期終了
+        # （従来の完全生成チェックは削除）
 
     # Phase 2: Dynamic Budget Reallocation
     t_used_base = t_base * num_blocks
@@ -476,21 +476,47 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
             # Apply additional refinement steps
             for i in range(additional_steps[num_block]):
-                if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                    break  # Block fully generated
-
                 nfe += 1
+
+                # Phase 3の各ステップで低信頼度トークンを再マスク
                 mask_index = (x == mask_id)
                 logits = model(x).logits
+
+                # 現在のブロックの信頼度をチェック
+                p = F.softmax(logits.to(torch.float64), dim=-1)
+                current_tokens = x[:, current_block_start:current_block_end]
+                current_confidence = torch.gather(p[:, current_block_start:current_block_end],
+                                                  dim=-1,
+                                                  index=current_tokens.unsqueeze(-1)).squeeze(-1)
+
+                # 低信頼度トークンを再マスク
+                low_confidence_mask = current_confidence < threshold
+                x[:, current_block_start:current_block_end] = torch.where(
+                    low_confidence_mask,
+                    torch.tensor(mask_id, device=x.device),
+                    current_tokens
+                )
+
+                # 再マスクされたトークンがない場合は早期終了
+                if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                    print(f"  ステップ {i+1}: 精錬完了（低信頼度トークンなし）")
+                    break
+
+                # マスクインデックスを更新
+                mask_index = (x == mask_id)
                 mask_index[:, current_block_end:] = 0
 
-                # Use single-step refinement
-                x0, transfer_index, _ = get_transfer_index_with_confidence(
+                # 1つのトークンを精錬
+                x0, transfer_index, refined_confidence = get_transfer_index_with_confidence(
                     logits, temperature, remasking, mask_index, x,
-                    # Transfer 1 token per step
                     torch.tensor([[1]], device=x.device))
 
                 x[transfer_index] = x0[transfer_index]
+
+                # 精錬進捗を表示
+                remaining_masks = (
+                    x[:, current_block_start:current_block_end] == mask_id).sum().item()
+                print(f"  ステップ {i+1}: 残りマスク={remaining_masks}, NFE={nfe}")
 
     print(f"DRS生成完了 - 総NFE: {nfe}")
     return x, nfe, block_confidences
