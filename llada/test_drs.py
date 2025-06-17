@@ -362,24 +362,246 @@ def test_drs_ablation_study():
         return None
 
 
+def test_drs_critical_analysis():
+    """
+    批判的分析: DRSの真の価値を検証
+
+    現状の問題:
+    1. 全ブロックが早期完成 → 「難しいブロック」が存在しない
+    2. 研究仮定の破綻: 動的配分の必要性が証明されていない
+    3. 効率化の原因が「早期終了」であり、「適応的計算配分」ではない
+
+    解決策:
+    1. より厳しい閾値とより難しいタスクを使用
+    2. t_baseを極端に小さくして未完成ブロックを強制的に作る
+    3. 真の難易度差を検証
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"使用デバイス: {device}")
+
+    # より抽象的で曖昧性の高いタスク
+    truly_challenging_prompts = [
+        # 高度な抽象思考 - 曖昧性が高い
+        "Analyze the philosophical implications of artificial consciousness. If an AI system claims to experience qualia, how would we verify this claim? Discuss the hard problem of consciousness, the Chinese room argument, and whether computational processes can give rise to genuine subjective experience. Consider multiple perspectives from materialist, dualist, and panpsychist viewpoints, and propose criteria for distinguishing between simulated and genuine consciousness.",
+
+        # 複雑な創作 - 一貫性が困難
+        "Write a surreal short story that seamlessly blends three completely different genres: cyberpunk noir, medieval fantasy, and cosmic horror. The protagonist must be simultaneously a detective investigating a murder in neo-Tokyo, a knight seeking a mystical artifact, and an astronomer discovering something terrifying in deep space. These three realities should be the same person experiencing parallel dimensions that begin to converge catastrophically. Maintain narrative coherence while exploring themes of identity fragmentation.",
+
+        # 極度に複雑な論理推論
+        "Consider a fictional universe where the laws of physics change based on collective human belief. In this world, if 60% of people believe gravity is weaker on Tuesdays, it actually becomes weaker. Now imagine three competing scientific theories about consciousness emerge, each with different implications for how reality should behave. Theory A suggests consciousness creates reality, Theory B suggests reality creates consciousness, and Theory C suggests both co-create each other cyclically. If these theories gain 30%, 35%, and 35% belief respectively, what would happen to the nature of scientific observation itself? Analyze the paradoxes and feedback loops.",
+
+        # 多重制約下での創造性
+        "Design a new form of mathematics that operates on emotional rather than numerical relationships. Define at least 5 fundamental operations (like addition/subtraction equivalents) that work with feelings like joy, melancholy, anxiety, wonder, and nostalgia. Create axioms that govern how these emotional operations interact, ensuring logical consistency. Then use this emotional mathematics to solve a practical problem: how to optimize the emotional experience of a user interface. Show your work using your new mathematical notation, and prove that your system is both internally consistent and useful for real-world applications."
+    ]
+
+    try:
+        print("モデルをロード中...")
+        model = LLaDAModelLM.from_pretrained(
+            'GSAI-ML/LLaDA-8B-Instruct',
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16
+        ).to(device).eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            'GSAI-ML/LLaDA-8B-Instruct',
+            trust_remote_code=True
+        )
+        print("モデルロード完了")
+
+        # より厳しいテスト条件
+        gen_length = 384  # より長い生成
+        block_length = 32
+        total_steps = 192
+
+        print(f"\n{'='*80}")
+        print("DRS批判的分析: 真の価値検証")
+        print(f"{'='*80}")
+        print("目的: 研究仮定の検証 - '難しいブロック'は本当に存在するか？")
+
+        critical_results = []
+
+        for i, prompt in enumerate(truly_challenging_prompts):
+            print(f"\n{'='*80}")
+            print(f"極限挑戦タスク {i+1}: {prompt[:100]}...")
+            print(f"{'='*80}")
+
+            m = [{"role": "user", "content": prompt}]
+            prompt_formatted = tokenizer.apply_chat_template(
+                m, add_generation_prompt=True, tokenize=False)
+            input_ids = tokenizer(prompt_formatted)['input_ids']
+            input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
+
+            # 段階的に厳しくする実験
+            test_conditions = [
+                {'t_base': 4, 'threshold': 0.7, 'name': '厳しい条件'},
+                {'t_base': 3, 'threshold': 0.6, 'name': '極限条件'},
+                {'t_base': 2, 'threshold': 0.5, 'name': '最極限条件'},
+            ]
+
+            for condition in test_conditions:
+                print(f"\n{'-'*60}")
+                print(
+                    f"テスト条件: {condition['name']} (t_base={condition['t_base']}, threshold={condition['threshold']})")
+                print(f"{'-'*60}")
+
+                # ベースライン
+                baseline_out, baseline_nfe = generate(
+                    model, input_ids, steps=total_steps, gen_length=gen_length,
+                    block_length=block_length, temperature=0., remasking='low_confidence'
+                )
+
+                # DRS（極限設定）
+                drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
+                    model, input_ids, steps=total_steps, gen_length=gen_length,
+                    block_length=block_length, temperature=0.,
+                    threshold=condition['threshold'], t_base=condition['t_base']
+                )
+
+                # 批判的分析
+                has_ambiguous_blocks = any(
+                    score > 0 for score in ambiguity_scores)
+                max_ambiguity = max(
+                    ambiguity_scores) if ambiguity_scores else 0
+                ambiguity_variance = np.var(
+                    ambiguity_scores) if ambiguity_scores else 0
+
+                baseline_text = tokenizer.batch_decode(
+                    baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
+                drs_text = tokenizer.batch_decode(
+                    drs_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
+
+                nfe_reduction = ((baseline_nfe - drs_nfe) / baseline_nfe) * 100
+                quality_preservation = len(
+                    drs_text.split()) / len(baseline_text.split()) * 100
+
+                # 批判的評価
+                print(f"結果分析:")
+                print(
+                    f"  NFE削減: {nfe_reduction:.1f}% ({baseline_nfe} → {drs_nfe})")
+                print(f"  品質保持: {quality_preservation:.1f}%")
+                print(
+                    f"  難しいブロック存在: {'YES' if has_ambiguous_blocks else 'NO'}")
+                print(f"  最大曖昧度: {max_ambiguity:.3f}")
+                print(f"  曖昧度分散: {ambiguity_variance:.3f}")
+                print(f"  曖昧度分布: {ambiguity_scores}")
+
+                # DRSの真の価値評価
+                if has_ambiguous_blocks and ambiguity_variance > 0.01:
+                    print(f"  ✅ DRS価値: TRUE - 動的配分が有効")
+                elif nfe_reduction > 30:
+                    print(f"  ⚠️  DRS価値: PARTIAL - 早期終了効果のみ")
+                else:
+                    print(f"  ❌ DRS価値: FALSE - 効果なし")
+
+                critical_results.append({
+                    'task': i+1,
+                    'condition': condition['name'],
+                    'has_ambiguous_blocks': has_ambiguous_blocks,
+                    'max_ambiguity': max_ambiguity,
+                    'ambiguity_variance': ambiguity_variance,
+                    'nfe_reduction': nfe_reduction,
+                    'quality_preservation': quality_preservation,
+                    'true_drs_value': has_ambiguous_blocks and ambiguity_variance > 0.01
+                })
+
+                # NFE使用量が異常に少ない場合の警告
+                if drs_nfe < total_steps * 0.4:
+                    print(
+                        f"  🚨 警告: 早期終了率が高すぎる ({(1 - drs_nfe/total_steps)*100:.1f}%)")
+                    print(f"       これは研究仮定の破綻を示唆している")
+
+        # 最終的な批判的分析
+        print(f"\n{'='*80}")
+        print("批判的分析結果サマリー")
+        print(f"{'='*80}")
+
+        true_drs_cases = sum(
+            1 for r in critical_results if r['true_drs_value'])
+        total_cases = len(critical_results)
+        avg_max_ambiguity = np.mean([r['max_ambiguity']
+                                    for r in critical_results])
+        avg_variance = np.mean([r['ambiguity_variance']
+                               for r in critical_results])
+
+        print(
+            f"真のDRS価値を示したケース: {true_drs_cases}/{total_cases} ({true_drs_cases/total_cases*100:.1f}%)")
+        print(f"平均最大曖昧度: {avg_max_ambiguity:.3f}")
+        print(f"平均曖昧度分散: {avg_variance:.3f}")
+
+        print(f"\n研究への示唆:")
+        if true_drs_cases == 0:
+            print("❌ 研究仮定の完全な破綻:")
+            print("   - '難しいブロック'が存在しない")
+            print("   - DRSの動的配分価値が証明されない")
+            print("   - 効率化は早期終了効果のみ")
+            print("   → 研究方向の根本的見直しが必要")
+        elif true_drs_cases < total_cases * 0.3:
+            print("⚠️  研究仮定の部分的破綻:")
+            print("   - 稀にしか'難しいブロック'が出現しない")
+            print("   - DRSの適用範囲が限定的")
+            print("   → タスク選択の再考が必要")
+        else:
+            print("✅ 研究仮定の部分的検証:")
+            print("   - 条件によっては'難しいブロック'が存在")
+            print("   - DRSの動的配分に価値がある")
+            print("   → より適切な閾値設定の探索が必要")
+
+        return critical_results
+
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 if __name__ == "__main__":
     print("DRS (Dynamic Refinement Scheduling) 包括的研究検証")
     print("=" * 80)
+    print("⚠️  重要: 初期結果は全て早期終了 → 研究仮定の検証が必要")
     print("研究目的: 同じ品質でNFE削減 + 複雑タスクでの適応的計算配分")
     print("=" * 80)
 
-    # 1. 挑戦的タスクでの基本検証
-    print("\n1. 挑戦的タスクでのDRS効果検証")
-    challenging_results = test_drs_with_challenging_tasks()
+    # 批判的分析を最初に実行（最重要）
+    print("\n🔍 CRITICAL: DRS批判的分析 - 研究仮定の検証")
+    critical_results = test_drs_critical_analysis()
 
-    # 2. スケーラビリティテスト
-    print("\n2. DRSスケーラビリティテスト")
-    scalability_results = test_drs_scalability()
+    # 批判的分析の結果に基づいて継続判断
+    if critical_results:
+        true_drs_value_found = any(r['true_drs_value']
+                                   for r in critical_results)
 
-    # 3. 詳細アブレーションスタディ
-    print("\n3. DRS詳細アブレーションスタディ")
-    ablation_results = test_drs_ablation_study()
+        if true_drs_value_found:
+            print("\n✅ 批判的分析で真のDRS価値を確認 → 追加テスト実行")
+
+            # 1. 挑戦的タスクでの基本検証
+            print("\n1. 挑戦的タスクでのDRS効果検証")
+            challenging_results = test_drs_with_challenging_tasks()
+
+            # 2. スケーラビリティテスト
+            print("\n2. DRSスケーラビリティテスト")
+            scalability_results = test_drs_scalability()
+
+            # 3. 詳細アブレーションスタディ
+            print("\n3. DRS詳細アブレーションスタディ")
+            ablation_results = test_drs_ablation_study()
+
+        else:
+            print("\n❌ 批判的分析で真のDRS価値を確認できず")
+            print("   → 追加テストをスキップ（研究仮定の破綻）")
+            print("   → 研究方向の根本的見直しを推奨")
 
     print("\n" + "=" * 80)
+    print("🎯 最終評価:")
+    print("=" * 80)
+
+    if critical_results and any(r['true_drs_value'] for r in critical_results):
+        print("✅ DRSに研究価値あり - 条件付きで動的配分が有効")
+        print("📋 推奨: より適切なタスクセットと閾値での継続研究")
+    else:
+        print("❌ DRSの研究価値に疑問 - 主に早期終了効果のみ")
+        print("📋 推奨: 研究方向の転換または新しいアプローチの探索")
+        print("   例: 別の効率化手法、異なるモデル、新しい評価基準")
+
     print("研究検証完了")
     print("=" * 80)
