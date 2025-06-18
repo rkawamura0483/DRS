@@ -577,8 +577,10 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                 current_confidence = torch.gather(
                     p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
 
-                # 動的な再マスク閾値（保守的）
-                remask_threshold = max(threshold * 0.8, 0.5)  # より慎重な再マスク
+                # 動的な再マスク閾値（さらに保守的に改善）
+                # 🔑 修正: 過度な再マスクを防ぐため、より厳しい閾値を設定
+                # より慎重な再マスク（0.5→0.8に上昇）
+                remask_threshold = max(threshold * 0.9, 0.8)
                 low_conf_mask = current_confidence < remask_threshold
 
                 if low_conf_mask.sum().item() > 0:
@@ -789,8 +791,9 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
         return x, nfe, block_confidences
 
     # より保守的な追加ステップ配分（曖昧度が高いブロックのみ）
+    # 🔑 修正: 精錬対象ブロックの選択をより厳しくし、品質劣化を防ぐ
     high_ambiguity_blocks = [i for i, score in enumerate(
-        block_confidences) if score > 0.15]  # 閾値を0.2→0.15に緩和
+        block_confidences) if score > 0.25]  # 閾値を0.15→0.25に引き上げ
 
     if len(high_ambiguity_blocks) == 0:
         print("  → 高曖昧度ブロックなし。追加精錬をスキップ")
@@ -831,8 +834,10 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
             current_confidence = torch.gather(
                 p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
 
-            # 動的な再マスク閾値（保守的）
-            remask_threshold = max(threshold * 0.8, 0.5)  # より慎重な再マスク
+            # 動的な再マスク閾値（さらに保守的に改善）
+            # 🔑 修正: 過度な再マスクを防ぐため、より厳しい閾値を設定
+            # より慎重な再マスク（0.5→0.8に上昇）
+            remask_threshold = max(threshold * 0.9, 0.8)
             low_conf_mask = current_confidence < remask_threshold
 
             if low_conf_mask.sum().item() > 0:
