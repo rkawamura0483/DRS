@@ -269,7 +269,9 @@ def generate_with_adaptive_scheduling(
                     print(f"   平均信頼度: {avg_conf:.3f}")
 
             # アダプティブ調整
-            if block_metrics['confidence_scores'] is not None:
+            if (block_metrics['confidence_scores'] is not None and
+                block_metrics['final_logits'] is not None and
+                    block_metrics['final_mask_index'] is not None):
                 adaptation_start = time.time()
 
                 # スケジューラーによる適応（ブロック分のデータを渡す）
@@ -304,7 +306,8 @@ def generate_with_adaptive_scheduling(
                     adaptation_start
             else:
                 # 信頼度スコアがない場合のフォールバック
-                print(f"⚠️  ブロック {block_id}: 信頼度スコアなし、適応をスキップ")
+                if verbose:
+                    print(f"⚠️  ブロック {block_id}: 適応データ不足、適応をスキップ")
                 # デフォルト値で記録
                 metrics['block_size_history'].append(actual_block_size)
                 metrics['threshold_history'].append(current_threshold)

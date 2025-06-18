@@ -103,6 +103,10 @@ class AdaptiveInferenceScheduler:
         Returns:
             平均エントロピー
         """
+        # None チェック
+        if logits is None or mask_index is None:
+            return 0.0
+
         # 形状の整合性を確認
         if logits.shape[:2] != mask_index.shape:
             # 最小の次元に合わせる
@@ -137,6 +141,10 @@ class AdaptiveInferenceScheduler:
         Returns:
             (平均信頼度, エントロピー)
         """
+        # None チェック
+        if logits is None or tokens is None or mask_index is None:
+            return 0.0, 0.0
+
         # エントロピーを計算
         entropy = self.calculate_entropy(logits, mask_index)
 
