@@ -38,13 +38,13 @@ class AdaptiveInferenceScheduler:
         min_threshold: float = 0.7,
         max_threshold: float = 0.95,
         confidence_window: int = 5,
-        adaptation_sensitivity: float = 0.1,  # より敏感に調整
-        entropy_threshold_high: float = 1.5,  # より低い閾値
-        entropy_threshold_low: float = 0.8,   # より高い閾値
-        scale_up_factor: float = 1.4,        # より積極的な拡大
-        scale_down_factor: float = 0.7,      # より積極的な縮小
-        safety_factor: float = 1.05,         # より小さな調整
-        efficiency_factor: float = 0.95      # より小さな調整
+        adaptation_sensitivity: float = 0.05,  # より敏感に調整（0.1 -> 0.05）
+        entropy_threshold_high: float = 1.0,   # より低い閾値（1.5 -> 1.0）
+        entropy_threshold_low: float = 0.5,    # より低い閾値（0.8 -> 0.5）
+        scale_up_factor: float = 1.5,         # より積極的な拡大（1.4 -> 1.5）
+        scale_down_factor: float = 0.6,       # より積極的な縮小（0.7 -> 0.6）
+        safety_factor: float = 1.1,           # より大きな調整（1.05 -> 1.1）
+        efficiency_factor: float = 0.9        # より大きな調整（0.95 -> 0.9）
     ):
         """
         アダプティブスケジューラーの初期化
@@ -144,21 +144,22 @@ class AdaptiveInferenceScheduler:
         if not mask_index.any():
             return 0.0, entropy
 
-        # logits、tokens、mask_indexの形状を確認して整合性を保つ
-        if logits.shape[1] != tokens.shape[1] or tokens.shape[1] != mask_index.shape[1]:
-            # 形状が一致しない場合、最小の次元に合わせる
-            min_seq_len = min(
-                logits.shape[1], tokens.shape[1], mask_index.shape[1])
-            logits = logits[:, :min_seq_len]
-            tokens = tokens[:, :min_seq_len]
-            mask_index = mask_index[:, :min_seq_len]
+        # 形状の整合性を確保
+        min_seq_len = min(
+            logits.shape[1], tokens.shape[1], mask_index.shape[1])
+        logits_trimmed = logits[:, :min_seq_len]
+        tokens_trimmed = tokens[:, :min_seq_len]
+        mask_trimmed = mask_index[:, :min_seq_len]
 
-        probs = F.softmax(logits.to(torch.float64), dim=-1)
+        # ソフトマックス確率を計算
+        probs = F.softmax(logits_trimmed.to(torch.float64), dim=-1)
+
+        # トークンの確率を取得
         token_probs = torch.gather(
-            probs, dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)
+            probs, dim=-1, index=tokens_trimmed.unsqueeze(-1)).squeeze(-1)
 
         # マスクされた位置の信頼度のみを考慮
-        masked_confidences = token_probs[mask_index]
+        masked_confidences = token_probs[mask_trimmed]
         avg_confidence = masked_confidences.mean().item(
         ) if masked_confidences.numel() > 0 else 0.0
 
@@ -285,6 +286,10 @@ class AdaptiveInferenceScheduler:
         avg_confidence, entropy = self.calculate_confidence_metrics(
             logits, tokens, mask_index)
 
+        # 現在の状態を保存（適応検出用）
+        old_block_size = self.current_block_size
+        old_threshold = self.current_threshold
+
         # 適応を実行すべきかチェック
         if self.should_adapt(step_num, total_steps):
             # ブロックサイズを適応
@@ -293,9 +298,9 @@ class AdaptiveInferenceScheduler:
             # 閾値を適応
             adapted_threshold = self.adapt_threshold(entropy)
 
-            # 適応カウントを更新（より厳密にチェック）
-            if (next_block_size != self.current_block_size or
-                    abs(adapted_threshold - self.current_threshold) > 0.005):
+            # 適応が実際に発生したかチェック（より緩い条件）
+            if (next_block_size != old_block_size or
+                    abs(adapted_threshold - old_threshold) > 0.001):
                 self.adaptation_count += 1
         else:
             next_block_size = self.current_block_size
@@ -309,7 +314,8 @@ class AdaptiveInferenceScheduler:
             'entropy': entropy,
             'block_size': next_block_size,
             'threshold': adapted_threshold,
-            'adapted': self.adaptation_count > 0
+            'adapted': (next_block_size != old_block_size or
+                        abs(adapted_threshold - old_threshold) > 0.001)
         }
 
         return next_block_size, adapted_threshold, step_metrics

@@ -174,8 +174,13 @@ def generate_with_adaptive_scheduling(
         **scheduler_config
     )
 
-    # 初期ブロックサイズを明示的に設定
-    scheduler.current_block_size = base_block_size
+    # 初期ブロックサイズを設定（スケジューラーの内部状態に従う）
+    current_block_size = scheduler.current_block_size
+    current_threshold = scheduler.current_threshold
+
+    if verbose:
+        print(
+            f"🎯 初期設定: ブロックサイズ={current_block_size}, 閾値={current_threshold:.3f}")
 
     # キャッシュマネージャーの初期化
     cache_manager = None
@@ -186,10 +191,6 @@ def generate_with_adaptive_scheduling(
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
-
-    # 初期ブロックサイズで開始
-    current_block_size = base_block_size
-    current_threshold = base_confidence_threshold
 
     # メトリクス収集
     metrics = {
@@ -259,6 +260,14 @@ def generate_with_adaptive_scheduling(
             metrics['nfe'] += block_metrics['nfe']
             metrics['timing']['generation_time'] += block_metrics['generation_time']
 
+            if verbose:
+                print(f"📈 ブロック {block_id} 完了: NFE={block_metrics['nfe']}, "
+                      f"信頼度スコア有無={block_metrics['confidence_scores'] is not None}")
+                if block_metrics['confidence_scores'] is not None:
+                    avg_conf = block_metrics['confidence_scores'].mean().item() if len(
+                        block_metrics['confidence_scores']) > 0 else 0.0
+                    print(f"   平均信頼度: {avg_conf:.3f}")
+
             # アダプティブ調整
             if block_metrics['confidence_scores'] is not None:
                 adaptation_start = time.time()
@@ -280,7 +289,7 @@ def generate_with_adaptive_scheduling(
                         print(f"🔄 適応: ブロックサイズ {current_block_size}→{next_block_size}, "
                               f"閾値 {current_threshold:.3f}→{adapted_threshold:.3f}")
 
-                # 更新
+                # スケジューラーからの適応結果を使用（重要な修正）
                 current_block_size = next_block_size
                 current_threshold = adapted_threshold
 
@@ -293,6 +302,14 @@ def generate_with_adaptive_scheduling(
 
                 metrics['timing']['adaptation_time'] += time.time() - \
                     adaptation_start
+            else:
+                # 信頼度スコアがない場合のフォールバック
+                print(f"⚠️  ブロック {block_id}: 信頼度スコアなし、適応をスキップ")
+                # デフォルト値で記録
+                metrics['block_size_history'].append(actual_block_size)
+                metrics['threshold_history'].append(current_threshold)
+                metrics['confidence_history'].append(0.0)
+                metrics['entropy_history'].append(0.0)
 
             # キャッシュ使用状況の記録
             if enable_tiered_cache and block_metrics['cache_tier']:
@@ -504,10 +521,14 @@ def _generate_block_adaptive_complete(
             if block_mask_was_generated.any():
                 confidence_scores = x0_p[block_mask_was_generated]
             else:
-                confidence_scores = torch.tensor([])
+                # マスクされた位置がない場合でも、デフォルト値を設定
+                confidence_scores = torch.tensor([0.5])
         else:
             # ランダム戦略の場合は一律の信頼度
-            confidence_scores = torch.ones(actual_block_size) * 0.5
+            confidence_scores = torch.ones(max(1, actual_block_size)) * 0.5
+    else:
+        # フォールバック: ロジットやマスクがない場合
+        confidence_scores = torch.tensor([0.5])
 
     # キャッシュ更新
     if cache_manager is not None and confidence_scores is not None and len(confidence_scores) > 0:

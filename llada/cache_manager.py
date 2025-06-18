@@ -184,6 +184,7 @@ class TieredCacheManager:
                 self.tier2_cache[block_id] = self._deep_copy_cache(
                     cache_to_save)
                 self.stable_blocks.add(block_id)
+                self.cache_misses += 1  # 更新はミスとしてカウント
                 print(f"Tier2 (Stable): ブロック {block_id} キャッシュ更新")
             else:
                 # 再利用時はヒットとしてカウント
