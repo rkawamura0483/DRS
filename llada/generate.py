@@ -538,7 +538,8 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
             if num_remasked > 0:
                 print(f"    - {num_remasked}個の低信頼度トークンを再マスク")
-                x[:, current_block_start:current_block_end][remask_index] = mask_id
+                x[:, current_block_start:current_block_end][remask_index.unsqueeze(
+                    0)] = mask_id
             else:
                 print(f"    - 再マスク対象なし、高品質のためスキップ")
                 continue
