@@ -83,9 +83,9 @@ class AdaptiveInferenceScheduler:
 
     def reset_state(self):
         """適応状態をリセット"""
-        # 初期ブロックサイズは min_block_size の1.5倍程度に設定（より保守的に開始）
+        # 初期ブロックサイズは中間値から開始（より適切な初期値）
         self.current_block_size = max(self.min_block_size,
-                                      min(self.min_block_size * 2, self.max_block_size))
+                                      min((self.min_block_size + self.max_block_size) // 2, self.max_block_size))
         self.current_threshold = self.base_confidence_threshold
         self.confidence_history = deque(maxlen=self.confidence_window)
         self.entropy_history = deque(maxlen=self.confidence_window)

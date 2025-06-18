@@ -170,9 +170,16 @@ def generate_with_adaptive_scheduling(
         min_block_size=max(4, base_block_size // 2),
         max_block_size=min(64, base_block_size * 3),
         base_confidence_threshold=base_confidence_threshold,
-        adaptation_sensitivity=adaptation_rate,
+        adaptation_sensitivity=0.05,  # より保守的な値に変更（0.2→0.05）
+        entropy_threshold_high=1.2,   # より適切な値に調整（0.8→1.2）
+        entropy_threshold_low=0.4,    # より適切な値に調整（0.3→0.4）
+        scale_up_factor=1.4,          # より控えめに調整（1.6→1.4）
+        scale_down_factor=0.7,        # より控えめに調整（0.5→0.7）
         **scheduler_config
     )
+
+    # 初期ブロックサイズを明示的に設定
+    scheduler.current_block_size = base_block_size
 
     # 初期ブロックサイズを設定（スケジューラーの内部状態に従う）
     current_block_size = scheduler.current_block_size
@@ -274,29 +281,51 @@ def generate_with_adaptive_scheduling(
                     block_metrics['final_mask_index'] is not None):
                 adaptation_start = time.time()
 
-                # スケジューラーによる適応（ブロック分のデータを渡す）
-                next_block_size, adapted_threshold, step_metrics = scheduler.step(
-                    logits=block_metrics['final_logits'],
-                    tokens=x[:, block_start:block_end],
-                    mask_index=block_metrics['final_mask_index'],
-                    step_num=block_id,
-                    total_steps=gen_length // base_block_size
+                # ブロック生成関数からの信頼度を直接使用（より正確）
+                block_confidence = block_metrics['confidence_scores'].mean().item() if len(
+                    block_metrics['confidence_scores']) > 0 else 0.0
+
+                # エントロピー計算のため、スケジューラーの計算を呼び出す
+                _, entropy = scheduler.calculate_confidence_metrics(
+                    block_metrics['final_logits'],
+                    x[:, block_start:block_end],
+                    block_metrics['final_mask_index']
                 )
 
-                # 適応検出
-                if (next_block_size != current_block_size or
-                        abs(adapted_threshold - current_threshold) > 0.01):
+                # 適応を実行（信頼度は直接渡す）
+                old_block_size = scheduler.current_block_size
+                old_threshold = scheduler.current_threshold
+
+                # ブロックサイズ適応
+                next_block_size = scheduler.adapt_block_size(block_confidence)
+
+                # 閾値適応
+                adapted_threshold = scheduler.adapt_threshold(entropy)
+
+                # 適応カウント
+                if (next_block_size != old_block_size or
+                        abs(adapted_threshold - old_threshold) > 0.01):
+                    scheduler.adaptation_count += 1
                     metrics['total_adaptations'] += 1
                     if verbose:
                         print(f"🔄 適応: ブロックサイズ {current_block_size}→{next_block_size}, "
                               f"閾値 {current_threshold:.3f}→{adapted_threshold:.3f}")
 
-                # スケジューラーからの適応結果を使用（重要な修正）
+                # ステップメトリクス
+                step_metrics = {
+                    'confidence': block_confidence,
+                    'entropy': entropy,
+                    'block_size': next_block_size,
+                    'threshold': adapted_threshold,
+                    'adapted': (next_block_size != old_block_size or
+                                abs(adapted_threshold - old_threshold) > 0.001)
+                }
+
+                # スケジューラーからの適応結果を使用
                 current_block_size = next_block_size
                 current_threshold = adapted_threshold
 
-                # メトリクス記録（スケジューラーの意図したブロックサイズを記録）
-                # actual_block_size -> next_block_size
+                # メトリクス記録
                 metrics['block_size_history'].append(next_block_size)
                 metrics['threshold_history'].append(adapted_threshold)
                 metrics['confidence_history'].append(
@@ -420,13 +449,20 @@ def _generate_block_adaptive_complete(
     # ブロック内のマスクインデックス
     block_mask_index = (x[:, block_start:block_end] == mask_id)
     if not block_mask_index.any():
-        # すでに生成済み
+        # すでに生成済みの場合でも、適応用のダミーデータを生成
+        vocab_size = 32000  # LLaMAベースの語彙サイズ（より適切な値）
+        dummy_logits = torch.zeros(
+            (x.shape[0], block_end - block_start, vocab_size))
+        dummy_mask = torch.zeros(
+            (x.shape[0], block_end - block_start), dtype=torch.bool)
+        dummy_confidence = torch.ones(1) * 0.8  # 高い信頼度でダミー
+
         return True, {
             'nfe': 0,
             'generation_time': 0,
-            'confidence_scores': None,
-            'final_logits': None,
-            'final_mask_index': None,
+            'confidence_scores': dummy_confidence,
+            'final_logits': dummy_logits,
+            'final_mask_index': dummy_mask,
             'cache_tier': None
         }
 
@@ -437,6 +473,10 @@ def _generate_block_adaptive_complete(
     output = model(x, use_cache=True)
     past_key_values = output.past_key_values
     nfe += 1
+
+    # 初期ロジットを保存（適応データ確保のため）
+    initial_logits = output.logits[:, block_start:block_end]  # ブロック範囲のロジットのみ
+    initial_mask_index = block_mask_index
 
     # 全体のマスクインデックス（ブロック範囲外はマスクしない）
     mask_index = (x == mask_id)
@@ -462,21 +502,32 @@ def _generate_block_adaptive_complete(
 
     # 反復的生成（残りのステップ）
     i = 1
-    while True:
-        nfe += 1
+    last_valid_logits = initial_logits  # 有効なロジットを保持
+    last_valid_mask = initial_mask_index  # 有効なマスクを保持
 
+    while True:
         # 現在のブロック内のマスクをチェック
         current_mask_index = (x[:, block_start:block_end] == mask_id)
 
         if not current_mask_index.any():
             # ブロック内のすべてのマスクが解決された
+            # 最後の有効なロジットとマスクを使用
+            final_logits = last_valid_logits
+            final_mask_index = last_valid_mask
             break
 
+        nfe += 1
+
         # キャッシュを使用してブロック範囲のみ推論
-        logits = model(x[:, block_start:block_end],
-                       past_key_values=past_key_values,
-                       use_cache=True,
-                       replace_position=replace_position).logits
+        output_step = model(x[:, block_start:block_end],
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            replace_position=replace_position)
+        logits = output_step.logits
+
+        # 有効なロジットとマスクを更新
+        last_valid_logits = logits
+        last_valid_mask = current_mask_index
 
         # トークン生成 - dual_cacheパターンに従う
         if current_threshold is not None:
@@ -499,22 +550,20 @@ def _generate_block_adaptive_complete(
         # ブロック範囲でトークンを更新
         x[:, block_start:block_end][transfer_index] = x0[transfer_index]
 
-        # 最後のロジットと信頼度を保存
-        final_logits = logits
-        final_mask_index = current_mask_index
-
-        # 信頼度計算
-        if remasking == 'low_confidence':
-            p = F.softmax(logits.to(torch.float64), dim=-1)
-            x0_p = torch.squeeze(
-                torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-            confidence_scores = torch.where(current_mask_index, x0_p, -np.inf)
-
         i += 1
 
         # 安全機構：無限ループ防止
         if i > steps * 2:
+            # 強制終了時も有効なデータを設定
+            final_logits = last_valid_logits
+            final_mask_index = last_valid_mask
             break
+
+    # 最終ロジットが設定されていない場合のフォールバック
+    if final_logits is None:
+        final_logits = last_valid_logits
+    if final_mask_index is None:
+        final_mask_index = last_valid_mask
 
     # 最終的な信頼度スコアの計算（ブロック全体の平均）
     if final_logits is not None and final_mask_index is not None:
@@ -525,19 +574,19 @@ def _generate_block_adaptive_complete(
             final_generated_tokens = x[:, block_start:block_end]
             x0_p = torch.squeeze(
                 torch.gather(p, dim=-1, index=torch.unsqueeze(final_generated_tokens, -1)), -1)
-            # マスクされていた位置の信頼度のみを取得
-            block_mask_was_generated = (x[:, block_start:block_end] != mask_id)
-            if block_mask_was_generated.any():
-                confidence_scores = x0_p[block_mask_was_generated]
+            # 元々マスクされていた位置の信頼度のみを取得
+            original_mask_positions = (block_mask_index)  # 元のマスク位置
+            if original_mask_positions.any():
+                confidence_scores = x0_p[original_mask_positions]
             else:
-                # マスクされた位置がない場合でも、デフォルト値を設定
-                confidence_scores = torch.tensor([0.5])
+                # マスクされた位置がない場合でも、妥当なデフォルト値を設定
+                confidence_scores = torch.tensor([0.8])  # 高めの信頼度
         else:
             # ランダム戦略の場合は一律の信頼度
             confidence_scores = torch.ones(max(1, actual_block_size)) * 0.5
     else:
-        # フォールバック: ロジットやマスクがない場合
-        confidence_scores = torch.tensor([0.5])
+        # フォールバック: ロジットやマスクがない場合でも妥当な値を設定
+        confidence_scores = torch.tensor([0.8])  # 高めの信頼度
 
     # キャッシュ更新
     if cache_manager is not None and confidence_scores is not None and len(confidence_scores) > 0:

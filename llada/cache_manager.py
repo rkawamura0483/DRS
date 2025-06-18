@@ -125,13 +125,16 @@ class TieredCacheManager:
         if len(self.block_confidences[block_id]) > self.confidence_memory_window:
             self.block_confidences[block_id] = self.block_confidences[block_id][-self.confidence_memory_window:]
 
-        # より積極的な安定性の判定
+        # より厳格な安定性の判定（元の設定に戻す）
         recent_confidences = self.block_confidences[block_id]
-        if len(recent_confidences) >= 1:  # 最低1回の観測でも判定可能
-            # 閾値をさらに下げてより多くのブロックをStableに分類
-            stable_confidence = avg_confidence > (
-                self.tier2_stability_threshold - 0.25)  # 0.85 -> 0.60
-            confidence_stable = True  # 変動チェックを緩和
+        if len(recent_confidences) >= 2:  # 最低2回の観測で判定
+            # 元の閾値を使用してより選別的にStableに分類
+            stable_confidence = avg_confidence > self.tier2_stability_threshold  # 元の0.85を使用
+
+            # 信頼度の安定性もチェック
+            confidence_std = np.std(recent_confidences) if len(
+                recent_confidences) > 1 else 0.0
+            confidence_stable = confidence_std < 0.1  # 標準偏差が小さい場合のみ安定と判定
 
             if stable_confidence and confidence_stable and len(self.stable_blocks) < self.max_stable_blocks:
                 return CacheTier.STABLE
