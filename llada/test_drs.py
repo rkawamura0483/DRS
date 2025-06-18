@@ -240,7 +240,7 @@ def enhanced_drs_validation():
                 print(f"     NFE: {baseline_nfe}")
                 print(
                     f"     品質: {baseline_quality:.3f} (coherence:{baseline_details['coherence']:.3f}, completeness:{baseline_details['completeness']:.3f}, math:{baseline_details['math_accuracy']:.3f})")
-                print(f"     テキスト: {baseline_text[:150]}...")
+                print(f"     テキスト: {baseline_text}")
 
                 print(f"  ⚡ {config['name']}:")
                 print(
@@ -248,7 +248,7 @@ def enhanced_drs_validation():
                 print(
                     f"     品質: {drs_quality:.3f} (coherence:{drs_details['coherence']:.3f}, completeness:{drs_details['completeness']:.3f}, math:{drs_details['math_accuracy']:.3f})")
                 print(f"     品質差分: {drs_quality-baseline_quality:+.3f}")
-                print(f"     テキスト: {drs_text[:150]}...")
+                print(f"     テキスト: {drs_text}")
                 print(f"     トレードオフ評価: {tradeoff_rating}")
                 print(f"     曖昧度スコア: {[f'{s:.3f}' for s in ambiguity_scores]}")
 
