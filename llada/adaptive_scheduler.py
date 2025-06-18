@@ -38,13 +38,13 @@ class AdaptiveInferenceScheduler:
         min_threshold: float = 0.7,
         max_threshold: float = 0.95,
         confidence_window: int = 5,
-        adaptation_sensitivity: float = 0.05,  # より敏感に調整（0.1 -> 0.05）
-        entropy_threshold_high: float = 1.0,   # より低い閾値（1.5 -> 1.0）
-        entropy_threshold_low: float = 0.5,    # より低い閾値（0.8 -> 0.5）
-        scale_up_factor: float = 1.5,         # より積極的な拡大（1.4 -> 1.5）
-        scale_down_factor: float = 0.6,       # より積極的な縮小（0.7 -> 0.6）
-        safety_factor: float = 1.1,           # より大きな調整（1.05 -> 1.1）
-        efficiency_factor: float = 0.9        # より大きな調整（0.95 -> 0.9）
+        adaptation_sensitivity: float = 0.02,  # さらに敏感に（0.05 -> 0.02）
+        entropy_threshold_high: float = 0.8,   # さらに低い閾値（1.0 -> 0.8）
+        entropy_threshold_low: float = 0.3,    # さらに低い閾値（0.5 -> 0.3）
+        scale_up_factor: float = 1.6,         # さらに積極的（1.5 -> 1.6）
+        scale_down_factor: float = 0.5,       # さらに積極的（0.6 -> 0.5）
+        safety_factor: float = 1.15,          # より大きな調整（1.1 -> 1.15）
+        efficiency_factor: float = 0.85       # より大きな調整（0.9 -> 0.85）
     ):
         """
         アダプティブスケジューラーの初期化
@@ -186,16 +186,18 @@ class AdaptiveInferenceScheduler:
         # 信頼度履歴を更新
         self.confidence_history.append(avg_confidence)
 
-        # ウィンドウ内の信頼度傾向を分析
-        if len(self.confidence_history) < 2:
+        # ウィンドウ内の信頼度傾向を分析（最低1回の観測で開始）
+        if len(self.confidence_history) < 1:
             return self.current_block_size
 
-        recent_avg = np.mean(list(self.confidence_history)
-                             [-3:]) if len(self.confidence_history) >= 3 else avg_confidence
+        # 最近の信頼度を使用（単一の値でも適応可能）
+        recent_avg = avg_confidence  # 即座に反応
 
         # 高信頼度: ブロックサイズを拡大
         high_threshold = self.current_threshold + self.adaptation_sensitivity
         low_threshold = self.current_threshold - self.adaptation_sensitivity
+
+        old_size = self.current_block_size
 
         if recent_avg > high_threshold:
             new_size = min(self.max_block_size,
@@ -250,11 +252,7 @@ class AdaptiveInferenceScheduler:
         Returns:
             適応実行フラグ
         """
-        # 最初のステップは適応を避ける（安定化のため）
-        if step < 1:
-            return False
-
-        # 毎ステップ適応を許可（より反応的に）
+        # 毎ステップ適応を許可（最初のステップからも適応）
         return True
 
     def get_adaptation_metrics(self) -> Dict[str, Any]:

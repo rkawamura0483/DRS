@@ -240,7 +240,7 @@ def generate_with_adaptive_scheduling(
 
             if verbose and block_id % 5 == 0:
                 print(
-                    f"\n📦 ブロック {block_id}: サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
+                    f"\n📦 ブロック {block_id}: 意図サイズ={current_block_size}, 実際サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
 
             # ブロック生成 - 完全な反復的生成を実行
             block_generated, block_metrics = _generate_block_adaptive_complete(
@@ -295,12 +295,17 @@ def generate_with_adaptive_scheduling(
                 current_block_size = next_block_size
                 current_threshold = adapted_threshold
 
-                # メトリクス記録（実際に使用されたブロックサイズを記録）
-                metrics['block_size_history'].append(actual_block_size)
+                # メトリクス記録（スケジューラーの意図したブロックサイズを記録）
+                # actual_block_size -> next_block_size
+                metrics['block_size_history'].append(next_block_size)
                 metrics['threshold_history'].append(adapted_threshold)
                 metrics['confidence_history'].append(
                     step_metrics['confidence'])
                 metrics['entropy_history'].append(step_metrics['entropy'])
+
+                if verbose:
+                    print(f"📊 記録: 意図サイズ={next_block_size}, 実際サイズ={actual_block_size}, "
+                          f"信頼度={step_metrics['confidence']:.3f}, エントロピー={step_metrics['entropy']:.3f}")
 
                 metrics['timing']['adaptation_time'] += time.time() - \
                     adaptation_start
@@ -308,8 +313,9 @@ def generate_with_adaptive_scheduling(
                 # 信頼度スコアがない場合のフォールバック
                 if verbose:
                     print(f"⚠️  ブロック {block_id}: 適応データ不足、適応をスキップ")
-                # デフォルト値で記録
-                metrics['block_size_history'].append(actual_block_size)
+                # デフォルト値で記録（現在のブロックサイズを使用）
+                # actual_block_size -> current_block_size
+                metrics['block_size_history'].append(current_block_size)
                 metrics['threshold_history'].append(current_threshold)
                 metrics['confidence_history'].append(0.0)
                 metrics['entropy_history'].append(0.0)
