@@ -470,9 +470,8 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                 print(f"  ブロック {num_block}: {i} ステップで早期完了")
                 break
 
-            replace_position = torch.zeros(
-                (1, block_length), dtype=torch.bool, device=x.device)
-            replace_position[:, :] = 1  # ブロック全体を対象
+            replace_position = torch.zeros_like(x, dtype=torch.bool)
+            replace_position[:, current_block_start:current_block_end] = True
 
             logits = model(x[:, current_block_start:current_block_end], past_key_values=trimmed_past_key_values,
                            use_cache=True, replace_position=replace_position).logits
@@ -548,10 +547,7 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
             # リファインメントの前に、一度プレフィックスのKVキャッシュを作成する
             # これは各ブロックのリファインメントの直前に行うことで、最新の状態を反映する
-            replace_position_prefix = torch.zeros_like(x, dtype=torch.bool)
-            replace_position_prefix[:, :current_block_start] = 1
-            output = model(x[:, :current_block_start], use_cache=True,
-                           replace_position=replace_position_prefix)
+            output = model(x[:, :current_block_start], use_cache=True)
             past_key_values = output.past_key_values
             nfe += 1
 
@@ -565,9 +561,9 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
                 nfe += 1
                 # replace_positionはシーケンス全体で定義し、現在のブロックのみTrueにする
-                replace_position = torch.zeros(
-                    (1, block_length), dtype=torch.bool, device=x.device)
-                replace_position[:, :] = True
+                replace_position = torch.zeros_like(x, dtype=torch.bool)
+                replace_position[:,
+                                 current_block_start:current_block_end] = True
 
                 # モデルには現在のブロックの入力と、プレフィックスのキャッシュを渡す
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
