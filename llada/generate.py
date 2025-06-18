@@ -303,32 +303,27 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
 
             mask_index[:, block_length:] = 0
 
-            logits = model(x[:, current_block_start:],
-                           past_key_values=past_key_values, use_cache=True).logits
+            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                           use_cache=True, replace_position=replace_position).logits
 
             # 信頼度デバッグ出力
             if remasking == 'low_confidence':
                 p = F.softmax(logits.to(torch.float64), dim=-1)
                 current_tokens = x[:,
                                    current_block_start:current_block_end].clone()
-                predicted_tokens = torch.argmax(
-                    logits[:, :block_length], dim=-1)
+                predicted_tokens = torch.argmax(logits, dim=-1)
                 current_tokens = torch.where(
                     mask_index, predicted_tokens, current_tokens)
                 confidence = torch.gather(
-                    p[:, :block_length], dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
+                    p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
                 valid_confidence = confidence[0][mask_index[0]]
                 if valid_confidence.numel() > 0:
                     print(
                         f"    - 信頼度: mean={valid_confidence.mean().item():.3f}, min={valid_confidence.min().item():.3f}, max={valid_confidence.max().item():.3f}")
 
-            logits_with_noise = add_gumbel_noise(
-                logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
-
             x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
-                                                    x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
-            x[:, current_block_start:][transfer_index] = x0[transfer_index]
+                                                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
 
             # ステップ後のデバッグ出力
             total_masks_after = (x == mask_id).sum().item()
