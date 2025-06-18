@@ -406,22 +406,17 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                       temperature=0., remasking='low_confidence', mask_id=None,
                       threshold=0.8, t_base=8):
     """
-    Dynamic Refinement Steps (DRS) を用いた生成関数。
-    研究仮説をクリーンに検証するために再実装されたバージョン。
-
-    処理は3つのフェーズで構成される:
-    1. 初期生成: 各ブロックを固定ステップ数(t_base)で生成し、信頼度情報を収集する。
-    2. 予算配分: 各ブロックの曖昧度を計算し、残りの推論予算を動的に配分する。
-    3. 動的リファインメント: 予算が配分されたブロックに対し、低信頼度トークンを再マスクして品質を向上させる。
+    Dynamic Refinement Steps (DRS) 実装
+    generate_with_dual_cacheをベースに、DRS仮説（動的予算配分＋リファインメント）のみを追加
     """
-    # マスクIDの取得
+    # マスクIDの取得（generate_with_dual_cacheと同じ）
     if mask_id is None:
-        if hasattr(model, 'tokenizer') and model.tokenizer.mask_token_id is not None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
             mask_id = model.tokenizer.mask_token_id
         else:
-            mask_id = model.config.mask_token_id or 126336
+            mask_id = model.config.mask_token_id
 
-    # シーケンスをマスクで初期化
+    # 初期化（generate_with_dual_cacheと同じ）
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -430,9 +425,9 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
     num_blocks = gen_length // block_length
 
     nfe = 0
-    block_final_confidences = []
+    block_confidences = []  # DRS用：各ブロックの最終信頼度
 
-    # ======== フェーズ1: 初期生成 ========
+    # ======== フェーズ1: 初期生成（Fast-dLLM + 信頼度収集）========
     print(f"Phase 1: 初期生成 (t_base={t_base} per block)")
 
     for num_block in range(num_blocks):
@@ -443,7 +438,7 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
             x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
 
-        # 初期化: generate_with_dual_cacheと同じパターン
+        # 初期化：generate_with_dual_cacheと完全に同じパターン
         output = model(x, use_cache=True)
         past_key_values = output.past_key_values
         mask_index = (x == mask_id)
@@ -453,115 +448,121 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
         x[transfer_index] = x0[transfer_index]
         nfe += 1
 
-        # ブロック内の残りステップを実行
+        # ブロック内反復：generate_with_dual_cacheと完全に同じパターン
         i = 1
         replace_position = torch.zeros_like(x, dtype=torch.bool)
-        replace_position[:, current_block_start:current_block_end] = True
-        while i < t_base:
+        replace_position[:, current_block_start:current_block_end] = 1
+        while True:
             nfe += 1
-            mask_index_block = (
+            mask_index = (
                 x[:, current_block_start:current_block_end] == mask_id)
-            if mask_index_block.sum() == 0:
-                print(f"  ブロック {num_block}: {i} ステップで早期完了")
+            if mask_index.sum() == 0 or i >= t_base:
                 break
 
             logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
                            use_cache=True, replace_position=replace_position).logits
 
-            x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index_block,
+            x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
                                                     x[:, current_block_start:current_block_end], num_transfer_tokens[:, i])
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
             i += 1
 
-        # 最終的なブロックの信頼度を計算・保存
-        final_logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                             use_cache=True, replace_position=replace_position).logits
-        nfe += 1
-        p = F.softmax(final_logits.to(torch.float64), dim=-1)
-        final_tokens = x[:, current_block_start:current_block_end]
-        final_confidence = torch.gather(
-            p, dim=-1, index=final_tokens.unsqueeze(-1)).squeeze(-1)
-        block_final_confidences.append(final_confidence[0])
+        # DRS追加：ブロックの最終信頼度を記録
+        if mask_index.sum() == 0:  # ブロックが完了した場合のみ
+            final_logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                                 use_cache=True, replace_position=replace_position).logits
+            nfe += 1
+            p = F.softmax(final_logits.to(torch.float64), dim=-1)
+            final_tokens = x[:, current_block_start:current_block_end]
+            confidence = torch.gather(
+                p, dim=-1, index=final_tokens.unsqueeze(-1)).squeeze(-1)
+            block_confidences.append(confidence[0])
+        else:
+            # ブロックが未完了の場合は低信頼度とみなす
+            block_confidences.append(torch.full(
+                (block_length,), 0.5, device=x.device))
 
-    # ======== フェーズ2: 予算配分 ========
-    t_used_base = nfe
-    t_refine = max(0, steps - t_used_base)
-    print(f"\nPhase 2: 予算配分 (残り予算: {t_refine})")
+    # ======== フェーズ2: DRS予算配分 ========
+    t_used = nfe
+    t_remaining = max(0, steps - t_used)
+    print(f"\nPhase 2: DRS予算配分 (使用済み: {t_used}, 残り: {t_remaining})")
 
-    block_ambiguities = [_calculate_ambiguity(
-        conf, threshold) for conf in block_final_confidences]
-    print(f"  ブロック曖昧度スコア: {[f'{s:.3f}' for s in block_ambiguities]}")
+    if t_remaining <= 0:
+        print("  → 予算なし、初期生成のみで終了")
+        ambiguity_scores = [_calculate_ambiguity(
+            conf, threshold) for conf in block_confidences]
+        return x, nfe, ambiguity_scores
 
-    if t_refine <= 0 or sum(block_ambiguities) == 0:
-        print("  → リファインメント予算なし、または全ブロック高品質のため終了")
-        return x, nfe, block_ambiguities
+    # 各ブロックの曖昧度計算
+    ambiguity_scores = [_calculate_ambiguity(
+        conf, threshold) for conf in block_confidences]
+    print(f"  ブロック曖昧度: {[f'{s:.3f}' for s in ambiguity_scores]}")
 
-    additional_steps = allocate_refinement_budget(block_ambiguities, t_refine)
+    # 予算配分
+    additional_steps = allocate_refinement_budget(
+        ambiguity_scores, t_remaining)
     print(f"  → 追加ステップ配分: {additional_steps}")
 
-    # ======== フェーズ3: 動的リファインメント ========
+    # ======== フェーズ3: DRSリファインメント ========
     if any(s > 0 for s in additional_steps):
-        print("\nPhase 3: 動的リファインメント開始")
+        print("\nPhase 3: DRSリファインメント")
 
-        for num_block, steps_to_add in enumerate(additional_steps):
-            if steps_to_add == 0:
+        for num_block, extra_steps in enumerate(additional_steps):
+            if extra_steps == 0:
                 continue
 
-            print(f"  → ブロック {num_block} を {steps_to_add} ステップでリファインメント")
+            print(f"  → ブロック {num_block}: {extra_steps} ステップ追加")
             current_block_start = prompt.shape[1] + num_block * block_length
             current_block_end = current_block_start + block_length
 
-            # --- 低信頼度トークンの再マスク ---
-            # 最後に計算した曖昧度スコアのもとになった信頼度を使う
-            current_confidence = block_final_confidences[num_block]
-            # ブロック内で閾値を下回るトークンを再マスク
-            remask_index_block = current_confidence < threshold
-            num_remasked = remask_index_block.sum().item()
+            # 低信頼度トークンの再マスク
+            current_confidence = block_confidences[num_block]
+            remask_indices = current_confidence < threshold
+            num_remasked = remask_indices.sum().item()
 
-            if num_remasked > 0:
-                print(f"    - {num_remasked}個の低信頼度トークンを再マスク")
-                x[:, current_block_start:current_block_end][remask_index_block.unsqueeze(
-                    0)] = mask_id
-            else:
-                print(f"    - 再マスク対象なし、高品質のためスキップ")
+            if num_remasked == 0:
+                print(f"    - 再マスク対象なし、スキップ")
                 continue
 
-            # リファインメントの前に、一度プレフィックスのKVキャッシュを作成する
-            # これは各ブロックのリファインメントの直前に行うことで、最新の状態を反映する
-            output = model(x[:, :current_block_start], use_cache=True)
+            print(f"    - {num_remasked}個のトークンを再マスク")
+            x[:, current_block_start:current_block_end][remask_indices.unsqueeze(
+                0)] = mask_id
+
+            # リファインメント実行：generate_with_dual_cacheパターンを再利用
+            output = model(x, use_cache=True)
             past_key_values = output.past_key_values
             nfe += 1
 
-            # --- リファインメント実行 ---
-            for i in range(steps_to_add):
-                mask_index_block = (
+            replace_position = torch.zeros_like(x, dtype=torch.bool)
+            replace_position[:, current_block_start:current_block_end] = 1
+
+            for step in range(extra_steps):
+                mask_index = (
                     x[:, current_block_start:current_block_end] == mask_id)
-                if mask_index_block.sum() == 0:
-                    print(f"    - {i+1} ステップでリファインメント完了")
+                if mask_index.sum() == 0:
+                    print(f"    - {step+1} ステップで完了")
                     break
 
                 nfe += 1
-                # replace_positionはシーケンス全体で定義し、現在のブロックのみTrueにする
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:,
-                                 current_block_start:current_block_end] = True
-
-                # モデルには現在のブロックの入力と、プレフィックスのキャッシュを渡す
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
                                use_cache=True, replace_position=replace_position).logits
 
+                # 残りステップに応じてトークン数を調整
+                remaining_steps = extra_steps - step
                 num_transfer_tokens = get_num_transfer_tokens(
-                    mask_index_block, steps_to_add - i)[:, 0]
+                    mask_index, remaining_steps)[:, 0]
 
-                x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
-                    logits, temperature, remasking, mask_index_block,
-                    x[:, current_block_start:current_block_end], num_transfer_tokens
-                )
-                x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
+                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
+                                                        x[:, current_block_start:current_block_end], num_transfer_tokens)
+                x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
 
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
-    print(f"\nDRS生成完了: 総NFE={nfe}, 未生成トークン数={final_masks}")
-    return x, nfe, block_ambiguities
+    print(f"\nDRS完了: 総NFE={nfe}, 未生成トークン={final_masks}")
+
+    # 最終的な曖昧度スコアを返す
+    final_ambiguity_scores = [_calculate_ambiguity(
+        conf, threshold) for conf in block_confidences]
+    return x, nfe, final_ambiguity_scores
 
 
 def main():
