@@ -773,6 +773,8 @@ class LLaDABlock(nn.Module):
                 # Perform the same operation for value
                 past_value[:, :, replace_indices] = v
                 v = past_value
+        elif replace_position is not None:
+            replace_indices = replace_position.nonzero(as_tuple=True)[1]
 
         present = (k, v) if use_cache else None  # present: None
         # could be different if layer_past not None
