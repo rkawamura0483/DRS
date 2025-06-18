@@ -47,7 +47,8 @@ def test_drs_hypothesis_validation():
         # 修正されたテスト設定
         gen_length = 384  # 長めの生成
         block_length = 32
-        total_steps = 256   # より多くのステップ予算
+        num_blocks = gen_length // block_length  # 12ブロック
+        total_steps = 252   # 12で割り切れるステップ数 (12 * 21 = 252)
 
         print(f"\n{'='*80}")
         print("修正版DRS仮説検証")
