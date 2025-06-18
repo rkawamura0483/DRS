@@ -63,7 +63,7 @@ def get_num_transfer_tokens(mask_index, steps):
 
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None):
+             remasking='low_confidence', mask_id=None, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -74,8 +74,15 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
+        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
     '''
+    # mask_idを適切に取得
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -109,7 +116,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 
 @torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                               remasking='low_confidence', mask_id=126336, threshold=None):
+                               remasking='low_confidence', mask_id=None, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -120,8 +127,15 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
+        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
     '''
+    # mask_idを適切に取得
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -186,7 +200,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
 @torch.no_grad()
 def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                             remasking='low_confidence', mask_id=126336, threshold=None):
+                             remasking='low_confidence', mask_id=None, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -197,8 +211,15 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
+        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
     '''
+    # mask_idを適切に取得
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -387,7 +408,16 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
     """
     # トークナイザーからマスクIDを取得（推奨）
     if mask_id is None:
-        mask_id = model.tokenizer.mask_token_id
+        if hasattr(model, 'tokenizer') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+            print(f"トークナイザーのmask_token_idがNoneのため、モデル設定から取得: {mask_id}")
+
+    # デフォルト値として126336を確保（LLaDAの正式なマスクトークンID）
+    if mask_id is None:
+        mask_id = 126336
+        print(f"モデル設定でもNoneのため、LLaDAデフォルト値を使用: {mask_id}")
 
     # シーケンスをマスクで初期化
     x = torch.full((1, prompt.shape[1] + gen_length),
@@ -625,6 +655,12 @@ def main():
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
     model.tokenizer = tokenizer  # モデルにトークナイザーをセット
 
+    # mask_idを確実に取得
+    mask_id = tokenizer.mask_token_id
+    if mask_id is None:
+        mask_id = model.config.mask_token_id
+        print(f"トークナイザーのmask_token_idがNoneのため、モデル設定から取得: {mask_id}")
+
     prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
@@ -636,7 +672,7 @@ def main():
     input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
     out, nfe = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128,
-                                        block_length=32, temperature=0., remasking='low_confidence', mask_id=model.tokenizer.mask_token_id)
+                                        block_length=32, temperature=0., remasking='low_confidence', mask_id=mask_id)
     print(tokenizer.batch_decode(
         out[0][:, input_ids.shape[1]:], skip_special_tokens=True)[0])
 

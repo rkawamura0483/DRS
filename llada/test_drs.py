@@ -43,7 +43,18 @@ def test_drs_hypothesis_validation():
             trust_remote_code=True
         )
         model.tokenizer = tokenizer  # モデルにトークナイザーをアタッチ
+
+        # トークナイザーのmask_token_idがNoneの場合、モデル設定から取得
         mask_id = tokenizer.mask_token_id
+        if mask_id is None:
+            mask_id = model.config.mask_token_id
+            print(f"トークナイザーのmask_token_idがNoneのため、モデル設定から取得: {mask_id}")
+
+        # デフォルト値として126336を確保（LLaDAの正式なマスクトークンID）
+        if mask_id is None:
+            mask_id = 126336
+            print(f"モデル設定でもNoneのため、LLaDAデフォルト値を使用: {mask_id}")
+
         print(f"モデルロード完了 (mask_id={mask_id})")
 
         # 修正されたテスト設定
