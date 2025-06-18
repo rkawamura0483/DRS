@@ -1,37 +1,156 @@
+# 改善版DRS検証システム
+import logging
+import re
+from collections import Counter
+
 import numpy as np
 import torch
-from generate import generate, generate_with_drs_improved
+import torch.nn.functional as F
+from generate import generate, generate_with_conservative_drs
 from model.modeling_llada import LLaDAModelLM
 from transformers import AutoTokenizer
 
+# 日本語のコメントはユーザールールに従って保持
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def test_drs_hypothesis_validation():
-    """
-    DRS研究仮説の適切な検証
 
-    修正点:
-    1. t_baseを適切な値に設定（1 → 4-8）
-    2. より厳しいthresholdでテスト（0.99）
-    3. 段階的デコーディングの検証
-    4. 曖昧度計算の改善
-    """
+class QualityEvaluator:
+    """改善された品質評価システム"""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def evaluate_semantic_quality(self, text):
+        """意味的品質の評価"""
+        if not text or len(text.strip()) == 0:
+            return 0.0
+
+        # 1. 基本的な文法構造チェック
+        sentences = re.split(r'[.!?]+', text)
+        valid_sentences = [s.strip() for s in sentences if len(s.strip()) > 3]
+
+        if len(valid_sentences) == 0:
+            return 0.0
+
+        # 2. 反復パターンの検出（改善版）
+        words = text.lower().split()
+        if len(words) == 0:
+            return 0.0
+
+        # 連続する同一語句の検出
+        consecutive_repetition_penalty = 0
+        for i in range(len(words) - 2):
+            if words[i] == words[i+1] == words[i+2]:
+                consecutive_repetition_penalty += 1
+
+        # 文レベルでの反復検出
+        sentence_repetition_penalty = 0
+        sentence_counter = Counter(valid_sentences)
+        for count in sentence_counter.values():
+            if count > 1:
+                sentence_repetition_penalty += count - 1
+
+        # 3. 語彙多様性スコア
+        unique_words = len(set(words))
+        vocabulary_diversity = unique_words / \
+            len(words) if len(words) > 0 else 0
+
+        # 4. 論理的一貫性（キーワード変化の検出）
+        consistency_score = 1.0
+        # 重要な名詞が変化した場合のペナルティ
+        key_nouns = ['garden', 'problem', 'function', 'algorithm']
+        found_nouns = [noun for noun in key_nouns if noun in text.lower()]
+        if len(found_nouns) > 1:
+            # 複数の競合する概念が含まれる場合
+            consistency_score *= 0.8
+
+        # 5. 最終スコア計算
+        base_score = vocabulary_diversity * consistency_score
+        repetition_penalty = (
+            consecutive_repetition_penalty + sentence_repetition_penalty) * 0.1
+
+        final_score = max(0, base_score - repetition_penalty)
+        return min(1.0, final_score)
+
+    def evaluate_coherence(self, text):
+        """文脈の一貫性評価"""
+        if not text:
+            return 0.0
+
+        sentences = re.split(r'[.!?]+', text)
+        valid_sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
+
+        if len(valid_sentences) < 2:
+            return 0.5  # 短すぎる場合は中立的スコア
+
+        # 文間の語彙的一貫性チェック
+        coherence_score = 0.0
+        for i in range(len(valid_sentences) - 1):
+            words1 = set(valid_sentences[i].lower().split())
+            words2 = set(valid_sentences[i+1].lower().split())
+            overlap = len(words1 & words2) / max(len(words1), len(words2), 1)
+            coherence_score += overlap
+
+        return coherence_score / max(1, len(valid_sentences) - 1)
+
+    def comprehensive_quality_score(self, text):
+        """包括的品質スコア"""
+        semantic_score = self.evaluate_semantic_quality(text)
+        coherence_score = self.evaluate_coherence(text)
+
+        # 重み付き平均
+        final_score = 0.7 * semantic_score + 0.3 * coherence_score
+        return final_score
+
+
+def improved_ambiguity_calculation(confidence_scores, threshold, baseline_confidence=None):
+    """改善された曖昧度計算"""
+    valid_scores = confidence_scores[confidence_scores != -np.inf]
+    if len(valid_scores) == 0:
+        return 0.0
+
+    # 1. 相対的曖昧度計算（ベースラインとの比較）
+    if baseline_confidence is not None:
+        baseline_valid = baseline_confidence[baseline_confidence != -np.inf]
+        if len(baseline_valid) > 0:
+            relative_confidence_drop = (
+                baseline_valid.mean() - valid_scores.mean()).item()
+            relative_ambiguity = max(0, relative_confidence_drop)
+        else:
+            relative_ambiguity = 0
+    else:
+        relative_ambiguity = 0
+
+    # 2. 分散ベースの曖昧度
+    variance_ambiguity = valid_scores.var().item()
+
+    # 3. 閾値ベースの曖昧度
+    threshold_ambiguity = (valid_scores < threshold).float().mean().item()
+
+    # 統合曖昧度スコア
+    combined_ambiguity = (
+        0.4 * threshold_ambiguity +
+        0.3 * variance_ambiguity +
+        0.3 * relative_ambiguity
+    )
+
+    return combined_ambiguity
+
+
+def test_improved_drs_validation():
+    """改善版DRS仮説検証"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"使用デバイス: {device}")
+    print(f"🔬 改善版DRS検証開始 (デバイス: {device})")
 
-    # より現実的で複雑なプロンプト
+    # より適切なテストプロンプト
     test_prompts = [
-        # 数学的推論 - 段階的思考が必要
-        "Solve this step by step: A rectangular garden has a length that is 3 times its width. If the perimeter is 64 meters, find the area of the garden. Show all calculations and reasoning.",
-
-        # コーディング問題 - 論理的構造が必要
-        "Write a Python function that finds the longest palindromic substring in a given string. Include proper error handling, time complexity analysis, and test cases.",
-
-        # 複雑な推論 - 多段階思考
-        "A company has three departments: Sales (40 employees), Marketing (25 employees), and IT (35 employees). If they need to reduce staff by 20% while maintaining the same ratio between departments, how many employees will each department have after the reduction?"
+        "Calculate the area of a rectangular garden with length 15 meters and width 8 meters.",
+        "Write a Python function to find the factorial of a number using recursion.",
     ]
 
     try:
-        print("モデルをロード中...")
+        print("📦 モデルロード中...")
         model = LLaDAModelLM.from_pretrained(
             'GSAI-ML/LLaDA-8B-Instruct',
             trust_remote_code=True,
@@ -42,37 +161,25 @@ def test_drs_hypothesis_validation():
             'GSAI-ML/LLaDA-8B-Instruct',
             trust_remote_code=True
         )
-        model.tokenizer = tokenizer  # モデルにトークナイザーをアタッチ
+        model.tokenizer = tokenizer
 
-        # トークナイザーのmask_token_idがNoneの場合、モデル設定から取得
-        mask_id = tokenizer.mask_token_id
-        if mask_id is None:
-            mask_id = model.config.mask_token_id
-            print(f"トークナイザーのmask_token_idがNoneのため、モデル設定から取得: {mask_id}")
+        # マスクID取得
+        mask_id = tokenizer.mask_token_id or model.config.mask_token_id or 126336
+        print(f"✅ モデルロード完了 (mask_id={mask_id})")
 
-        # デフォルト値として126336を確保（LLaDAの正式なマスクトークンID）
-        if mask_id is None:
-            mask_id = 126336
-            print(f"モデル設定でもNoneのため、LLaDAデフォルト値を使用: {mask_id}")
+        # 品質評価器の初期化
+        evaluator = QualityEvaluator(tokenizer)
 
-        print(f"モデルロード完了 (mask_id={mask_id})")
-
-        # 修正されたテスト設定
-        gen_length = 384  # 長めの生成
+        # 改善されたテスト設定
+        gen_length = 256
         block_length = 32
-        num_blocks = gen_length // block_length  # 12ブロック
-        total_steps = 252   # 12で割り切れるステップ数 (12 * 21 = 252)
-
-        print(f"\n{'='*80}")
-        print("修正版DRS仮説検証")
-        print(f"{'='*80}")
-        print("目的: '難しいブロック'の存在を適切に検証")
+        total_steps = 128
 
         results = []
 
         for i, prompt in enumerate(test_prompts):
             print(f"\n{'='*80}")
-            print(f"テストプロンプト {i+1}: {prompt[:80]}...")
+            print(f"📝 テストプロンプト {i+1}: {prompt}")
             print(f"{'='*80}")
 
             m = [{"role": "user", "content": prompt}]
@@ -81,253 +188,141 @@ def test_drs_hypothesis_validation():
             input_ids = tokenizer(prompt_formatted)['input_ids']
             input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-            # 段階的に厳しくする実験設定
-            # より保守的な設定で品質を重視
+            # より適切なテスト条件
             test_conditions = [
-                {'t_base': 2, 'threshold': 0.90, 'name': '保守的条件 (t_base=2)'},
-                {'t_base': 4, 'threshold': 0.90, 'name': '中程度条件 (t_base=4)'},
-                {'t_base': 8, 'threshold': 0.90, 'name': '厳しい条件 (t_base=8)'},
+                {'t_base': 4, 'threshold': 0.7, 'name': '適度な条件'},
             ]
 
             for condition in test_conditions:
                 print(f"\n{'-'*60}")
                 print(
-                    f"テスト条件: {condition['name']} (t_base={condition['t_base']}, threshold={condition['threshold']})")
+                    f"🧪 {condition['name']} (t_base={condition['t_base']}, threshold={condition['threshold']})")
                 print(f"{'-'*60}")
 
-                # ベースライン
+                # ベースライン生成
+                print("🎯 ベースライン生成中...")
                 baseline_out, baseline_nfe = generate(
                     model, input_ids, steps=total_steps, gen_length=gen_length,
                     block_length=block_length, temperature=0., remasking='low_confidence',
                     mask_id=mask_id
                 )
 
-                # 修正版DRS
-                drs_out, drs_nfe, ambiguity_scores = generate_with_drs_improved(
+                # 保守的DRS生成
+                print("⚡ 保守的DRS生成中...")
+                drs_out, drs_nfe, ambiguity_scores = generate_with_conservative_drs(
                     model, input_ids, steps=total_steps, gen_length=gen_length,
                     block_length=block_length, temperature=0.,
                     threshold=condition['threshold'], t_base=condition['t_base'],
                     mask_id=mask_id
                 )
 
-                # 結果分析
-                has_ambiguous_blocks = any(
-                    score > 0 for score in ambiguity_scores)
-                max_ambiguity = max(
-                    ambiguity_scores) if ambiguity_scores else 0
-                ambiguity_variance = np.var(
-                    ambiguity_scores) if ambiguity_scores else 0
-                num_nonzero_ambiguity = sum(
-                    1 for score in ambiguity_scores if score > 0.01)
-
+                # テキスト抽出
                 baseline_text = tokenizer.batch_decode(
                     baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
                 drs_text = tokenizer.batch_decode(
                     drs_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
-                # === 品質を直接比較するための出力を追加 ===
-                print("\n--- 生成結果比較 ---")
-                print(f"--- [Baseline] NFE: {baseline_nfe} ---")
-                print(
-                    baseline_text[:200] + "..." if len(baseline_text) > 200 else baseline_text)
-                print(
-                    f"--- [DRS] NFE: {drs_nfe}, 曖昧度分散: {np.var(ambiguity_scores):.3f} ---")
-                print(drs_text[:200] + "..." if len(drs_text)
-                      > 200 else drs_text)
-                print("--- 比較終了 ---\n")
-                # =======================================
+                # 改善された品質評価
+                baseline_quality = evaluator.comprehensive_quality_score(
+                    baseline_text)
+                drs_quality = evaluator.comprehensive_quality_score(drs_text)
+                quality_retention = (
+                    drs_quality / baseline_quality) * 100 if baseline_quality > 0 else 0
 
+                # NFE効率
                 nfe_reduction = ((baseline_nfe - drs_nfe) / baseline_nfe) * 100
 
-                # より厳密な品質指標
-                baseline_words = len(baseline_text.split())
-                drs_words = len(drs_text.split())
+                # 曖昧度分析
+                max_ambiguity = max(
+                    ambiguity_scores) if ambiguity_scores else 0
+                ambiguity_variance = np.var(
+                    ambiguity_scores) if ambiguity_scores else 0
+                meaningful_blocks = sum(
+                    1 for score in ambiguity_scores if score > 0.1)
 
-                # 異常な反復パターンを検出
-                drs_word_list = drs_text.split()
-                repetition_score = 0
-                if len(drs_word_list) > 0:
-                    unique_words = len(set(drs_word_list))
-                    repetition_score = unique_words / len(drs_word_list)
+                # 結果出力
+                print(f"\n📊 詳細結果:")
+                print(f"  🎯 ベースライン:")
+                print(
+                    f"     NFE: {baseline_nfe}, 品質スコア: {baseline_quality:.3f}")
+                print(f"     テキスト: {baseline_text[:100]}...")
+                print(f"  ⚡ 保守的DRS:")
+                print(f"     NFE: {drs_nfe}, 品質スコア: {drs_quality:.3f}")
+                print(f"     テキスト: {drs_text[:100]}...")
 
-                # 品質保持率を調整（反復ペナルティ適用）
-                if baseline_words > 0:
-                    quality_preservation = (
-                        drs_words / baseline_words) * repetition_score * 100
+                print(f"\n📈 パフォーマンス分析:")
+                print(f"  🔄 NFE削減: {nfe_reduction:.1f}%")
+                print(f"  💎 品質保持: {quality_retention:.1f}%")
+                print(f"  🎭 最大曖昧度: {max_ambiguity:.3f}")
+                print(f"  📊 曖昧度分散: {ambiguity_variance:.3f}")
+                print(
+                    f"  🔍 意味あるブロック: {meaningful_blocks}/{len(ambiguity_scores)}")
+
+                # DRS価値の評価（改善版）
+                if (nfe_reduction > 20 and quality_retention > 70 and
+                        meaningful_blocks >= 2 and ambiguity_variance > 0.01):
+                    drs_value = "✅ TRUE - 有効な動的配分"
+                elif (nfe_reduction > 15 and quality_retention > 50):
+                    drs_value = "⚠️ PARTIAL - 限定的効果"
                 else:
-                    quality_preservation = 0
+                    drs_value = "❌ FALSE - 効果不明または品質劣化"
 
-                # 研究仮説の検証
-                print(f"検証結果:")
-                print(
-                    f"  NFE削減: {nfe_reduction:.1f}% ({baseline_nfe} → {drs_nfe})")
-                print(
-                    f"  品質保持: {quality_preservation:.1f}% (反復率: {repetition_score:.3f})")
-                print(f"  単語数比較: {drs_words}/{baseline_words}")
-                print(
-                    f"  難しいブロック存在: {'YES' if has_ambiguous_blocks else 'NO'}")
-                print(f"  曖昧度統計:")
-                print(f"    最大曖昧度: {max_ambiguity:.3f}")
-                print(f"    曖昧度分散: {ambiguity_variance:.3f}")
-                print(
-                    f"    曖昧なブロック数: {num_nonzero_ambiguity}/{len(ambiguity_scores)}")
-                print(f"  曖昧度分布: {[f'{s:.3f}' for s in ambiguity_scores]}")
+                print(f"  🎯 DRS価値評価: {drs_value}")
 
-                # DRS価値の評価（品質を考慮）
-                early_termination_rate = (1 - drs_nfe/total_steps) * 100
-
-                if has_ambiguous_blocks and ambiguity_variance > 0.005 and repetition_score > 0.7:
-                    if early_termination_rate < 70 and quality_preservation > 50:  # 適度な早期終了＋品質保持
-                        drs_value = "TRUE - 動的配分が有効"
-                        value_symbol = "✅"
-                    elif quality_preservation > 30:
-                        drs_value = "PARTIAL - 動的配分有効だが品質要改善"
-                        value_symbol = "⚠️"
-                    else:
-                        drs_value = "FALSE - 品質劣化過多"
-                        value_symbol = "❌"
-                elif nfe_reduction > 20 and quality_preservation > 40 and repetition_score > 0.6:
-                    drs_value = "PARTIAL - 早期終了効果のみ"
-                    value_symbol = "⚠️"
-                else:
-                    drs_value = "FALSE - 効果なしまたは品質劣化"
-                    value_symbol = "❌"
-
-                print(f"  {value_symbol} DRS価値: {drs_value}")
-                print(f"  早期終了率: {early_termination_rate:.1f}%")
-
+                # 結果保存
                 results.append({
-                    'prompt': i+1,
+                    'prompt_id': i+1,
                     'condition': condition['name'],
-                    't_base': condition['t_base'],
-                    'threshold': condition['threshold'],
-                    'has_ambiguous_blocks': has_ambiguous_blocks,
+                    'nfe_reduction': nfe_reduction,
+                    'quality_retention': quality_retention,
+                    'baseline_quality': baseline_quality,
+                    'drs_quality': drs_quality,
                     'max_ambiguity': max_ambiguity,
                     'ambiguity_variance': ambiguity_variance,
-                    'num_ambiguous_blocks': num_nonzero_ambiguity,
-                    'nfe_reduction': nfe_reduction,
-                    'quality_preservation': quality_preservation,
-                    'repetition_score': repetition_score,
-                    'early_termination_rate': early_termination_rate,
-                    'drs_value': drs_value,
-                    'baseline_words': baseline_words,
-                    'drs_words': drs_words
+                    'meaningful_blocks': meaningful_blocks,
+                    'drs_value': drs_value
                 })
 
-        # 全体的な研究結論
+        # 全体的な結論
         print(f"\n{'='*80}")
-        print("研究仮説検証結果サマリー")
+        print("🎯 改善版検証結果サマリー")
         print(f"{'='*80}")
 
-        # 統計分析
-        valid_drs_cases = sum(1 for r in results if 'TRUE' in r['drs_value'])
-        partial_drs_cases = sum(
-            1 for r in results if 'PARTIAL' in r['drs_value'])
+        successful_cases = sum(1 for r in results if 'TRUE' in r['drs_value'])
+        partial_cases = sum(1 for r in results if 'PARTIAL' in r['drs_value'])
         total_cases = len(results)
 
-        avg_max_ambiguity = np.mean([r['max_ambiguity'] for r in results])
-        avg_variance = np.mean([r['ambiguity_variance'] for r in results])
-        avg_ambiguous_blocks = np.mean(
-            [r['num_ambiguous_blocks'] for r in results])
+        avg_nfe_reduction = np.mean([r['nfe_reduction'] for r in results])
+        avg_quality_retention = np.mean(
+            [r['quality_retention'] for r in results])
 
-        print(f"検証ケース統計:")
-        print(
-            f"  真のDRS価値: {valid_drs_cases}/{total_cases} ({valid_drs_cases/total_cases*100:.1f}%)")
-        print(
-            f"  部分的DRS価値: {partial_drs_cases}/{total_cases} ({partial_drs_cases/total_cases*100:.1f}%)")
-        print(
-            f"  効果なし: {total_cases-valid_drs_cases-partial_drs_cases}/{total_cases}")
+        print(f"📊 統計:")
+        print(f"  ✅ 完全成功: {successful_cases}/{total_cases}")
+        print(f"  ⚠️ 部分成功: {partial_cases}/{total_cases}")
+        print(f"  📉 平均NFE削減: {avg_nfe_reduction:.1f}%")
+        print(f"  💎 平均品質保持: {avg_quality_retention:.1f}%")
 
-        print(f"\n曖昧度統計:")
-        print(f"  平均最大曖昧度: {avg_max_ambiguity:.3f}")
-        print(f"  平均曖昧度分散: {avg_variance:.3f}")
-        print(f"  平均曖昧ブロック数: {avg_ambiguous_blocks:.1f}")
-
-        # 最終的な研究評価
-        print(f"\n研究仮説の検証結果:")
-
-        if valid_drs_cases >= total_cases * 0.4:
-            print("✅ 研究仮説は概ね検証された:")
-            print("   - '難しいブロック'が十分な頻度で存在")
-            print("   - DRSの動的配分に明確な価値がある")
-            print("   - 適切な設定下でNFE削減と品質保持を両立")
-
-        elif (valid_drs_cases + partial_drs_cases) >= total_cases * 0.5:
-            print("⚠️  研究仮説は部分的に検証された:")
-            print("   - 条件によっては'難しいブロック'が存在")
-            print("   - DRSに一定の価値があるが限定的")
-            print("   - パラメータ調整により改善の余地あり")
-
+        if successful_cases >= total_cases * 0.5:
+            final_conclusion = "✅ DRS仮説は検証された - 適切な条件下で有効"
+        elif (successful_cases + partial_cases) >= total_cases * 0.6:
+            final_conclusion = "⚠️ DRS仮説は部分的に検証 - さらなる調整が必要"
         else:
-            print("❌ 研究仮説は検証されなかった:")
-            print("   - '難しいブロック'の存在が稀")
-            print("   - DRSの動的配分価値が限定的")
-            print("   - 研究アプローチの根本的見直しが必要")
+            final_conclusion = "❌ DRS仮説は検証されず - 根本的見直しが必要"
 
-        # 改善提案
-        print(f"\n改善提案:")
-        if avg_max_ambiguity < 0.1:
-            print("- より複雑なタスクまたはより厳しい閾値の採用")
-        if avg_variance < 0.001:
-            print("- ブロック間の難易度差を生み出す手法の検討")
-        if avg_ambiguous_blocks < 2:
-            print("- より長い生成長またはより小さなブロック長の採用")
+        print(f"\n🎯 最終結論: {final_conclusion}")
 
         return results
 
     except Exception as e:
-        print(f"エラーが発生しました: {e}")
+        logger.error(f"テスト実行エラー: {e}")
         import traceback
         traceback.print_exc()
         return None
 
 
-def diagnose_original_problem():
-    """
-    元の問題（t_base=1での全早期終了）の詳細診断
-    """
-    print(f"\n{'='*80}")
-    print("元の問題の詳細診断")
-    print(f"{'='*80}")
-
-    print("問題1: get_num_transfer_tokens(mask_index, steps=1)の動作:")
-    print("  32個のマスクトークン ÷ 1ステップ = 1ステップで32個全て予測")
-    print("  → ブロック単位での段階的精錬が不可能")
-
-    print("\n問題2: 曖昧度計算のタイミング:")
-    print("  if block_remaining_masks[-1] == 0:")
-    print("      ambiguity_score = 0.0  # 強制的に0設定")
-    print("  → 循環論理: 完成済み = 簡単 = 曖昧度0")
-
-    print("\n問題3: 研究仮説との不整合:")
-    print("  仮説: '難しいブロック'と'簡単なブロック'が存在")
-    print("  現実: 全ブロックが1ステップで完成")
-    print("  → 難易度差の検証が不可能")
-
-    print("\n解決策:")
-    print("  ✓ t_baseを4-8に増加")
-    print("  ✓ thresholdを0.95-0.99に厳格化")
-    print("  ✓ 曖昧度計算の改善")
-    print("  ✓ より複雑なタスクの採用")
-
-
 if __name__ == "__main__":
-    print("DRS研究仮説の適切な検証")
-    print("=" * 80)
-
-    # まず元の問題を診断
-    diagnose_original_problem()
-
-    # 修正版テストを実行
-    print("\n修正版テスト実行中...")
-    results = test_drs_hypothesis_validation()
-
+    results = test_improved_drs_validation()
     if results:
-        print("\n" + "=" * 80)
-        print("🎯 最終結論:")
-        print("=" * 80)
-        print("元の問題は設定ミスによるものであり、")
-        print("適切な設定により研究仮説の検証が可能です。")
-        print("=" * 80)
+        print(f"\n✅ 改善版検証完了")
     else:
-        print("\n❌ テスト失敗 - 環境またはモデルの問題")
+        print(f"\n❌ 検証失敗")

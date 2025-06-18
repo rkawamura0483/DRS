@@ -677,6 +677,215 @@ def generate_with_drs_fixed(model, prompt, steps=128, gen_length=128, block_leng
                                       temperature, remasking, mask_id, threshold, t_base)
 
 
+@torch.no_grad()
+def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, block_length=128,
+                                   temperature=0., remasking='low_confidence', mask_id=None,
+                                   threshold=0.7, t_base=6):
+    """
+    保守的DRS: 品質劣化を防ぐ改善版
+
+    主な改善点:
+    1. より保守的な閾値設定
+    2. 完成ブロックの再マスクを慎重に実行
+    3. 品質保持を優先した精錬ロジック
+    """
+    # マスクIDの適切な取得
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id or 126336
+
+    # シーケンス初期化
+    x = torch.full((1, prompt.shape[1] + gen_length),
+                   mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    # Phase 1: 初期生成（より保守的なアプローチ）
+    block_confidences = []
+    nfe = 0
+
+    print(f"Phase 1: 保守的初期パス - {t_base}ステップ x {num_blocks}ブロック")
+
+    for num_block in range(num_blocks):
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        # 各ブロックでt_baseステップを実行
+        block_mask_index = (
+            x[:, current_block_start:current_block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
+
+        # KVキャッシュを使用した効率的生成
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0
+
+        x0, transfer_index, confidence_scores_initial = get_transfer_index_with_confidence(
+            output.logits, temperature, remasking, mask_index, x,
+            num_transfer_tokens[:, 0] if len(num_transfer_tokens[0]) > 0 else None)
+        x[transfer_index] = x0[transfer_index]
+        nfe += 1
+
+        # 残りのステップ
+        replace_position = torch.zeros(
+            (1, block_length), dtype=torch.bool, device=x.device)
+        replace_position[:, :] = 1
+
+        for i in range(1, t_base):
+            nfe += 1
+            mask_index_block = (
+                x[:, current_block_start:current_block_end] == mask_id)
+
+            if mask_index_block.sum() == 0:
+                break  # ブロック完成
+
+            logits = model(x[:, current_block_start:current_block_end],
+                           past_key_values=past_key_values,
+                           use_cache=True, replace_position=replace_position).logits
+
+            x0_block, transfer_index_block, confidence_scores_block = get_transfer_index_with_confidence(
+                logits, temperature, remasking, mask_index_block,
+                x[:, current_block_start:current_block_end],
+                num_transfer_tokens[:, i] if i < len(num_transfer_tokens[0]) else None)
+
+            x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
+            confidence_scores_initial = confidence_scores_block
+
+        # 次のブロックのためのKVキャッシュ更新
+        if num_block < num_blocks - 1:
+            output = model(x[:, :current_block_end], use_cache=True)
+            past_key_values = output.past_key_values
+
+        # 保守的な曖昧度計算
+        if confidence_scores_initial is not None:
+            block_confidence = confidence_scores_initial[0]
+            valid_scores = block_confidence[block_confidence != -np.inf]
+            if len(valid_scores) > 0:
+                # より保守的な曖昧度計算: 高い閾値のみを使用
+                conservative_threshold = min(threshold + 0.1, 0.95)  # より高い閾値
+                ambiguity_score = (
+                    valid_scores < conservative_threshold).float().mean().item()
+            else:
+                ambiguity_score = 0.0
+        else:
+            ambiguity_score = 0.0
+
+        block_confidences.append(ambiguity_score)
+
+        remaining_masks = (
+            x[:, current_block_start:current_block_end] == mask_id).sum().item()
+        print(f"ブロック {num_block}: 残りマスク={remaining_masks}, "
+              f"曖昧度スコア={ambiguity_score:.3f}")
+
+    # Phase 2: 保守的な予算再配分
+    t_used_base = t_base * num_blocks
+    t_refine = max(0, steps - t_used_base)
+
+    print(f"\nPhase 2: 保守的予算再配分")
+    print(f"  使用済み予算: {nfe}")
+    print(f"  残り予算: {t_refine}")
+    print(f"  ブロック曖昧度スコア: {[f'{s:.3f}' for s in block_confidences]}")
+
+    if t_refine <= 0:
+        print(f"  → 予算不足。現在の状態で終了")
+        return x, nfe, block_confidences
+
+    # より保守的な追加ステップ配分（曖昧度が高いブロックのみ）
+    high_ambiguity_blocks = [i for i, score in enumerate(
+        block_confidences) if score > 0.2]
+
+    if len(high_ambiguity_blocks) == 0:
+        print("  → 高曖昧度ブロックなし。追加精錬をスキップ")
+        return x, nfe, block_confidences
+
+    additional_steps = allocate_refinement_budget(block_confidences, t_refine)
+    print(f"  → 追加ステップ配分: {additional_steps}")
+
+    # Phase 3: 非破壊的精錬（品質保持優先）
+    print(f"\nPhase 3: 保守的精錬開始")
+
+    for num_block, steps_to_add in enumerate(additional_steps):
+        if steps_to_add == 0 or num_block not in high_ambiguity_blocks:
+            continue
+
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        # 🔑 改善: 既存マスクのみを対象にし、完成トークンは保護
+        block_mask_index = (
+            x[:, current_block_start:current_block_end] == mask_id)
+
+        if block_mask_index.sum().item() > 0:
+            # 既存マスクがある場合のみ精錬
+            print(
+                f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
+
+            # KVキャッシュ準備
+            output = model(x, use_cache=True)
+            past_key_values_refine = output.past_key_values
+            nfe += 1
+
+            # プレフィックス部分のみ保持
+            new_past_key_values = []
+            for i in range(len(past_key_values_refine)):
+                new_past_key_values.append(())
+                for j in range(len(past_key_values_refine[i])):
+                    new_past_key_values[i] += (past_key_values_refine[i]
+                                               [j][:, :, :current_block_start],)
+            past_key_values_refine = new_past_key_values
+
+            num_transfer_tokens_refine = get_num_transfer_tokens(
+                block_mask_index, steps_to_add)
+
+            replace_pos_refine = torch.zeros(
+                (1, block_length), dtype=torch.bool, device=x.device)
+            replace_pos_refine[:, :] = 1
+
+            for i in range(steps_to_add):
+                if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
+                    print(f"    ブロック {num_block} の精錬完了")
+                    break
+
+                nfe += 1
+
+                logits = model(x[:, current_block_start:current_block_end],
+                               past_key_values=past_key_values_refine,
+                               use_cache=True,
+                               replace_position=replace_pos_refine).logits
+
+                refine_mask_index = (
+                    x[:, current_block_start:current_block_end] == mask_id)
+
+                tokens_to_transfer = (num_transfer_tokens_refine[:, i] if i < num_transfer_tokens_refine.shape[1]
+                                      else refine_mask_index.sum(dim=1, keepdim=True))
+
+                x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
+                    logits, temperature, remasking, refine_mask_index,
+                    x[:, current_block_start:current_block_end], tokens_to_transfer)
+
+                x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
+        else:
+            print(f"  → ブロック {num_block} は完成済み。品質保護のため精錬スキップ")
+
+    # 最終結果
+    final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
+    completion_rate = ((gen_length - final_masks) / gen_length) * 100
+
+    print(f"\n保守的DRS生成完了:")
+    print(f"  総NFE: {nfe}/{steps} ({(nfe/steps*100):.1f}%)")
+    print(
+        f"  完成率: {completion_rate:.1f}% ({gen_length - final_masks}/{gen_length})")
+    print(f"  検出された曖昧度ブロック: {len(high_ambiguity_blocks)}/{num_blocks}")
+    print(f"  曖昧度分散: {np.var(block_confidences):.3f}")
+
+    return x, nfe, block_confidences
+
+
 def main():
     device = 'cuda'
 
