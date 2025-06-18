@@ -263,7 +263,8 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
             x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
                                                     x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+            # Fast-dLLMアルゴリズムに従い、マスクが全て除去されるかステップ数上限に達したら終了
+            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0 or i >= steps:
                 break
             i += 1
 
