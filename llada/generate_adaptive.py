@@ -238,7 +238,7 @@ def generate_with_adaptive_scheduling(
             actual_block_size = min(current_block_size, remaining_tokens)
             block_end = block_start + actual_block_size
 
-            if verbose and block_id % 5 == 0:
+            if verbose:
                 print(
                     f"\n📦 ブロック {block_id}: 意図サイズ={current_block_size}, 実際サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
 

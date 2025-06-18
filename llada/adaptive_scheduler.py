@@ -38,7 +38,7 @@ class AdaptiveInferenceScheduler:
         min_threshold: float = 0.7,
         max_threshold: float = 0.95,
         confidence_window: int = 5,
-        adaptation_sensitivity: float = 0.02,  # さらに敏感に（0.05 -> 0.02）
+        adaptation_sensitivity: float = 0.1,   # より積極的な適応（0.02 -> 0.1）
         entropy_threshold_high: float = 0.8,   # さらに低い閾値（1.0 -> 0.8）
         entropy_threshold_low: float = 0.3,    # さらに低い閾値（0.5 -> 0.3）
         scale_up_factor: float = 1.6,         # さらに積極的（1.5 -> 1.6）

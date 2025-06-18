@@ -302,7 +302,7 @@ class AdaptiveSchedulingTester:
             base_confidence_threshold=0.8,
             adaptation_rate=0.2,
             enable_tiered_cache=True,
-            verbose=False
+            verbose=True  # 詳細ログを有効化
         )
         end_time = time.time()
 
@@ -385,7 +385,7 @@ class AdaptiveSchedulingTester:
             base_confidence_threshold=0.8,
             enable_tiered_cache=config['tiered_cache'],
             scheduler_config=scheduler_config,
-            verbose=False
+            verbose=True  # 詳細ログを有効化
         )
         end_time = time.time()
 
