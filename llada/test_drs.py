@@ -245,10 +245,10 @@ def test_improved_drs_validation():
                 print(f"  🎯 ベースライン:")
                 print(
                     f"     NFE: {baseline_nfe}, 品質スコア: {baseline_quality:.3f}")
-                print(f"     テキスト: {baseline_text[:100]}...")
+                print(f"     テキスト: {baseline_text}...")
                 print(f"  ⚡ 保守的DRS:")
                 print(f"     NFE: {drs_nfe}, 品質スコア: {drs_quality:.3f}")
-                print(f"     テキスト: {drs_text[:100]}...")
+                print(f"     テキスト: {drs_text}...")
 
                 print(f"\n📈 パフォーマンス分析:")
                 print(f"  🔄 NFE削減: {nfe_reduction:.1f}%")
