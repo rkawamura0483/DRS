@@ -6,7 +6,11 @@ from collections import Counter
 import numpy as np
 import torch
 import torch.nn.functional as F
-from generate import generate_with_drs, generate_with_dual_cache
+from generate import (
+    generate_with_drs,
+    generate_with_drs_uniform_allocation,
+    generate_with_dual_cache,
+)
 from generate_drs_v2 import generate_with_improved_drs
 from model.modeling_llada import LLaDAModelLM
 from transformers import AutoTokenizer
@@ -208,6 +212,8 @@ def enhanced_drs_validation():
                 {'t_base': 4, 'threshold': 0.7, 'name': 'DRS-Aggressive'},
                 {'t_base': 8, 'threshold': 0.8, 'name': 'DRS-Balanced'},
                 {'t_base': 12, 'threshold': 0.9, 'name': 'DRS-Conservative'},
+                {'t_base': 8, 'threshold': 0.8,
+                    'name': 'DRS-Uniform-Control', 'uniform_alloc': True},
             ]
 
             for config in drs_configs:
@@ -217,12 +223,21 @@ def enhanced_drs_validation():
                 print(f"{'-'*60}")
 
                 # DRS生成
-                drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
-                    model, input_ids, steps=total_steps, gen_length=gen_length,
-                    block_length=block_length, temperature=0.,
-                    threshold=config['threshold'], t_base=config['t_base'],
-                    mask_id=mask_id
-                )
+                if config.get('uniform_alloc'):
+                    drs_out, drs_nfe, ambiguity_scores = generate_with_drs_uniform_allocation(
+                        model, input_ids, steps=total_steps, gen_length=gen_length,
+                        block_length=block_length, temperature=0.,
+                        threshold=config['threshold'], t_base=config['t_base'],
+                        mask_id=mask_id
+                    )
+                else:
+                    drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
+                        model, input_ids, steps=total_steps, gen_length=gen_length,
+                        block_length=block_length, temperature=0.,
+                        threshold=config['threshold'], t_base=config['t_base'],
+                        mask_id=mask_id
+                    )
+
                 drs_text = tokenizer.batch_decode(
                     drs_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
@@ -316,9 +331,11 @@ def enhanced_drs_validation():
 
         # 設定別分析
         print(f"\n📋 設定別性能分析:")
-        for config_name in ['DRS-Aggressive', 'DRS-Balanced', 'DRS-Conservative']:
+        for config_name in ['DRS-Aggressive', 'DRS-Balanced', 'DRS-Conservative', 'DRS-Uniform-Control']:
             config_results = [
                 r for r in all_results if r['config'] == config_name]
+            if not config_results:
+                continue
             config_success = sum(1 for r in config_results if r['tradeoff_rating'] in [
                                  'EXCELLENT', 'GOOD'])
             config_avg_quality = np.mean(

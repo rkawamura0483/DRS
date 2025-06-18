@@ -401,6 +401,30 @@ def allocate_refinement_budget(block_ambiguities, total_refinement_budget):
     return additional_steps
 
 
+def allocate_refinement_budget_uniformly(block_ambiguities, total_refinement_budget):
+    """
+    リファインメント予算を、ゼロでない曖昧度を持つブロックに均等に割り当てる。
+    これは比例配分に対するコントロールとして機能する。
+    """
+    ambiguous_blocks = [i for i, amb in enumerate(
+        block_ambiguities) if amb > 0]
+    additional_steps = [0] * len(block_ambiguities)
+
+    if not ambiguous_blocks:
+        return additional_steps
+
+    steps_per_block = total_refinement_budget // len(ambiguous_blocks)
+    remainder = total_refinement_budget % len(ambiguous_blocks)
+
+    for i in ambiguous_blocks:
+        additional_steps[i] = steps_per_block
+
+    for i in range(remainder):
+        additional_steps[ambiguous_blocks[i]] += 1
+
+    return additional_steps
+
+
 @torch.no_grad()
 def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128,
                       temperature=0., remasking='low_confidence', mask_id=None,
@@ -560,6 +584,163 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
     print(f"\nDRS完了: 総NFE={nfe}, 未生成トークン={final_masks}")
 
     # 最終的な曖昧度スコアを返す
+    final_ambiguity_scores = [_calculate_ambiguity(
+        conf, threshold) for conf in block_confidences]
+    return x, nfe, final_ambiguity_scores
+
+
+@torch.no_grad()
+def generate_with_drs_uniform_allocation(model, prompt, steps=128, gen_length=128, block_length=128,
+                                         temperature=0., remasking='low_confidence', mask_id=None,
+                                         threshold=0.8, t_base=8):
+    """
+    DRS with Uniform Allocation (Control Experiment).
+    A version of DRS that allocates the refinement budget *uniformly* across all
+    ambiguous blocks, instead of proportionally. This helps isolate the impact
+    of the dynamic allocation strategy itself.
+    """
+    # マスクIDの取得（generate_with_drsと同じ）
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+
+    # 初期化（generate_with_drsと同じ）
+    x = torch.full((1, prompt.shape[1] + gen_length),
+                   mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    nfe = 0
+    block_confidences = []
+
+    # ======== フェーズ1: 初期生成 ========
+    print(f"Phase 1: 初期生成 (t_base={t_base} per block)")
+
+    for num_block in range(num_blocks):
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        block_mask_index = (
+            x[:, current_block_start:current_block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
+
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0
+        x0, transfer_index = get_transfer_index(
+            output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0])
+        x[transfer_index] = x0[transfer_index]
+        nfe += 1
+
+        i = 1
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, current_block_start:current_block_end] = 1
+        while True:
+            nfe += 1
+            mask_index = (
+                x[:, current_block_start:current_block_end] == mask_id)
+            if mask_index.sum() == 0 or i >= t_base:
+                break
+
+            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                           use_cache=True, replace_position=replace_position).logits
+
+            x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
+                                                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i])
+            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
+            i += 1
+
+        if mask_index.sum() == 0:
+            final_logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                                 use_cache=True, replace_position=replace_position).logits
+            nfe += 1
+            p = F.softmax(final_logits.to(torch.float64), dim=-1)
+            final_tokens = x[:, current_block_start:current_block_end]
+            confidence = torch.gather(
+                p, dim=-1, index=final_tokens.unsqueeze(-1)).squeeze(-1)
+            block_confidences.append(confidence[0])
+        else:
+            block_confidences.append(torch.full(
+                (block_length,), 0.5, device=x.device))
+
+    # ======== フェーズ2: DRS予算配分 (Uniform) ========
+    t_used = nfe
+    t_remaining = max(0, steps - t_used)
+    print(f"\nPhase 2: DRS Uniform予算配分 (使用済み: {t_used}, 残り: {t_remaining})")
+
+    if t_remaining <= 0:
+        print("  → 予算なし、初期生成のみで終了")
+        ambiguity_scores = [_calculate_ambiguity(
+            conf, threshold) for conf in block_confidences]
+        return x, nfe, ambiguity_scores
+
+    ambiguity_scores = [_calculate_ambiguity(
+        conf, threshold) for conf in block_confidences]
+    print(f"  ブロック曖昧度: {[f'{s:.3f}' for s in ambiguity_scores]}")
+
+    # ★★★ コントロール実験の核心部 ★★★
+    additional_steps = allocate_refinement_budget_uniformly(
+        ambiguity_scores, t_remaining)
+    print(f"  → 追加ステップ配分 (Uniform): {additional_steps}")
+
+    # ======== フェーズ3: DRSリファインメント ========
+    if any(s > 0 for s in additional_steps):
+        print("\nPhase 3: DRSリファインメント")
+
+        for num_block, extra_steps in enumerate(additional_steps):
+            if extra_steps == 0:
+                continue
+
+            print(f"  → ブロック {num_block}: {extra_steps} ステップ追加")
+            current_block_start = prompt.shape[1] + num_block * block_length
+            current_block_end = current_block_start + block_length
+
+            current_confidence = block_confidences[num_block]
+            remask_indices = current_confidence < threshold
+            num_remasked = remask_indices.sum().item()
+
+            if num_remasked == 0:
+                print(f"    - 再マスク対象なし、スキップ")
+                continue
+
+            print(f"    - {num_remasked}個のトークンを再マスク")
+            x[:, current_block_start:current_block_end][remask_indices.unsqueeze(
+                0)] = mask_id
+
+            output = model(x, use_cache=True)
+            past_key_values = output.past_key_values
+            nfe += 1
+
+            replace_position = torch.zeros_like(x, dtype=torch.bool)
+            replace_position[:, current_block_start:current_block_end] = 1
+
+            for step in range(extra_steps):
+                mask_index = (
+                    x[:, current_block_start:current_block_end] == mask_id)
+                if mask_index.sum() == 0:
+                    print(f"    - {step+1} ステップで完了")
+                    break
+
+                nfe += 1
+                logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                               use_cache=True, replace_position=replace_position).logits
+
+                remaining_steps = extra_steps - step
+                num_transfer_tokens = get_num_transfer_tokens(
+                    mask_index, remaining_steps)[:, 0]
+
+                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
+                                                        x[:, current_block_start:current_block_end], num_transfer_tokens)
+                x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
+
+    final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
+    print(f"\nDRS Uniform完了: 総NFE={nfe}, 未生成トークン={final_masks}")
+
     final_ambiguity_scores = [_calculate_ambiguity(
         conf, threshold) for conf in block_confidences]
     return x, nfe, final_ambiguity_scores
