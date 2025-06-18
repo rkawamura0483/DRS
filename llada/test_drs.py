@@ -217,7 +217,7 @@ def enhanced_drs_validation():
                 print(f"{'-'*60}")
 
                 # DRS生成
-                drs_out, drs_nfe, ambiguity_scores = generate_with_improved_drs(
+                drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
                     model, input_ids, steps=total_steps, gen_length=gen_length,
                     block_length=block_length, temperature=0.,
                     threshold=config['threshold'], t_base=config['t_base'],
