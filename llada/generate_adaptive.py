@@ -24,6 +24,13 @@ import time
 from adaptive_scheduler import AdaptiveInferenceScheduler
 from cache_manager import TieredCacheManager, CacheTier
 
+# 必要な関数をimport
+try:
+    from generate import get_transfer_index
+except ImportError:
+    # ローカルモジュールとして試行
+    from .generate import get_transfer_index
+
 
 def add_gumbel_noise(logits, temperature):
     """
@@ -140,20 +147,23 @@ def generate_with_adaptive_scheduling(
     scheduler_config = scheduler_config or {}
     cache_config = cache_config or {}
 
+    # マスクIDの取得 - LLaDAのデフォルト値を使用
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id'):
+            mask_id = model.tokenizer.mask_token_id
+        elif hasattr(model.config, 'mask_token_id'):
+            mask_id = model.config.mask_token_id
+        else:
+            mask_id = 126336  # LLaDAのデフォルトマスクトークンID
+
     if verbose:
         print(f"\n🚀 Adaptive Scheduling 開始")
         print(f"   プロンプト長: {prompt.shape[1]}")
         print(f"   生成長: {gen_length}")
         print(f"   初期ブロックサイズ: {base_block_size}")
         print(f"   初期信頼度閾値: {base_confidence_threshold}")
+        print(f"   マスクトークンID: {mask_id}")
         print(f"   階層キャッシュ: {enable_tiered_cache}")
-
-    # マスクIDの取得
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id'):
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
 
     # スケジューラーの初期化
     scheduler = AdaptiveInferenceScheduler(
@@ -228,8 +238,8 @@ def generate_with_adaptive_scheduling(
                 print(
                     f"\n📦 ブロック {block_id}: サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
 
-            # ブロック生成
-            block_generated, block_metrics = _generate_block_adaptive(
+            # ブロック生成 - 完全な反復的生成を実行
+            block_generated, block_metrics = _generate_block_adaptive_complete(
                 model=model,
                 x=x,
                 block_start=block_start,
@@ -239,7 +249,8 @@ def generate_with_adaptive_scheduling(
                 remasking=remasking,
                 cache_manager=cache_manager,
                 block_id=block_id,
-                mask_id=mask_id
+                mask_id=mask_id,
+                steps=8  # ブロック内でのステップ数
             )
 
             metrics['nfe'] += block_metrics['nfe']
@@ -336,6 +347,183 @@ def generate_with_adaptive_scheduling(
             print(f"   キャッシュヒット率: {cache_metrics['cache_hit_rate']:.2%}")
 
     return x, metrics
+
+
+def _generate_block_adaptive_complete(
+    model,
+    x: torch.Tensor,
+    block_start: int,
+    block_end: int,
+    current_threshold: float,
+    temperature: float,
+    remasking: str,
+    cache_manager: Optional[TieredCacheManager],
+    block_id: int,
+    mask_id: int,
+    steps: int = 8
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    完全なブロック生成（dual_cacheパターンに従う）
+
+    Args:
+        model: LLaDAモデル
+        x: 現在のトークンテンソル
+        block_start: ブロック開始位置
+        block_end: ブロック終了位置
+        current_threshold: 現在の信頼度閾値
+        temperature: サンプリング温度
+        remasking: リマスキング戦略
+        cache_manager: キャッシュマネージャー
+        block_id: ブロックID
+        mask_id: マスクトークンID
+        steps: ブロック内でのステップ数
+
+    Returns:
+        (生成成功フラグ, ブロックメトリクス)
+    """
+    block_start_time = time.time()
+    nfe = 0
+    confidence_scores = None
+    final_logits = None
+    final_mask_index = None
+    cache_tier = None
+
+    # ブロック内のマスクインデックス
+    block_mask_index = (x[:, block_start:block_end] == mask_id)
+    if not block_mask_index.any():
+        # すでに生成済み
+        return True, {
+            'nfe': 0,
+            'generation_time': 0,
+            'confidence_scores': None,
+            'final_logits': None,
+            'final_mask_index': None,
+            'cache_tier': None
+        }
+
+    # ステップ数の計算
+    num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+    # 初期推論（キャッシュ設定と第1ステップ）
+    output = model(x, use_cache=True)
+    past_key_values = output.past_key_values
+    nfe += 1
+
+    # 全体のマスクインデックス（ブロック範囲外はマスクしない）
+    mask_index = (x == mask_id)
+    mask_index[:, block_end:] = 0
+
+    # 第1ステップのトークン生成
+    if current_threshold is not None:
+        # 閾値ベースの生成 - dual_cacheと同様の処理
+        x0, transfer_index = get_transfer_index(
+            output.logits, temperature, remasking, mask_index, x,
+            None, current_threshold)
+    else:
+        # 通常のステップベース生成
+        x0, transfer_index = get_transfer_index(
+            output.logits, temperature, remasking, mask_index, x,
+            num_transfer_tokens[:, 0], None)
+
+    x[transfer_index] = x0[transfer_index]
+
+    # キャッシュ情報を設定（dual_cacheパターン）
+    replace_position = torch.zeros_like(x, dtype=torch.bool)
+    replace_position[:, block_start:block_end] = 1
+
+    # 反復的生成（残りのステップ）
+    i = 1
+    while True:
+        nfe += 1
+
+        # 現在のブロック内のマスクをチェック
+        current_mask_index = (x[:, block_start:block_end] == mask_id)
+
+        if not current_mask_index.any():
+            # ブロック内のすべてのマスクが解決された
+            break
+
+        # キャッシュを使用してブロック範囲のみ推論
+        logits = model(x[:, block_start:block_end],
+                       past_key_values=past_key_values,
+                       use_cache=True,
+                       replace_position=replace_position).logits
+
+        # トークン生成 - dual_cacheパターンに従う
+        if current_threshold is not None:
+            # 閾値ベースの生成
+            x0, transfer_index = get_transfer_index(
+                logits, temperature, remasking, current_mask_index,
+                x[:, block_start:block_end], None, current_threshold)
+        else:
+            # ステップベース生成
+            if i < steps:
+                x0, transfer_index = get_transfer_index(
+                    logits, temperature, remasking, current_mask_index,
+                    x[:, block_start:block_end], num_transfer_tokens[:, i], None)
+            else:
+                # 最終ステップ：残りすべてを生成
+                x0, transfer_index = get_transfer_index(
+                    logits, temperature, remasking, current_mask_index,
+                    x[:, block_start:block_end], current_mask_index.sum(dim=1, keepdim=True), None)
+
+        # ブロック範囲でトークンを更新
+        x[:, block_start:block_end][transfer_index] = x0[transfer_index]
+
+        # 最後のロジットと信頼度を保存
+        final_logits = logits
+        final_mask_index = current_mask_index
+
+        # 信頼度計算
+        if remasking == 'low_confidence':
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(
+                torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+            confidence_scores = torch.where(current_mask_index, x0_p, -np.inf)
+
+        i += 1
+
+        # 安全機構：無限ループ防止
+        if i > steps * 2:
+            break
+
+    # 最終的な信頼度スコアの計算（ブロック全体の平均）
+    if final_logits is not None and final_mask_index is not None:
+        actual_block_size = block_end - block_start
+        if remasking == 'low_confidence':
+            p = F.softmax(final_logits.to(torch.float64), dim=-1)
+            # 最終的に生成されたトークンの信頼度を計算
+            final_generated_tokens = x[:, block_start:block_end]
+            x0_p = torch.squeeze(
+                torch.gather(p, dim=-1, index=torch.unsqueeze(final_generated_tokens, -1)), -1)
+            # マスクされていた位置の信頼度のみを取得
+            block_mask_was_generated = (x[:, block_start:block_end] != mask_id)
+            if block_mask_was_generated.any():
+                confidence_scores = x0_p[block_mask_was_generated]
+            else:
+                confidence_scores = torch.tensor([])
+        else:
+            # ランダム戦略の場合は一律の信頼度
+            confidence_scores = torch.ones(actual_block_size) * 0.5
+
+    # キャッシュ更新
+    if cache_manager is not None and confidence_scores is not None and len(confidence_scores) > 0:
+        cache_tier = cache_manager.update_cache(
+            block_id=block_id,
+            start_pos=block_start,
+            end_pos=block_end,
+            past_key_values=output.past_key_values,
+            confidence_scores=confidence_scores
+        )
+
+    return True, {
+        'nfe': nfe,
+        'generation_time': time.time() - block_start_time,
+        'confidence_scores': confidence_scores,
+        'final_logits': final_logits,
+        'final_mask_index': final_mask_index,
+        'cache_tier': cache_tier
+    }
 
 
 def _generate_block_adaptive(
