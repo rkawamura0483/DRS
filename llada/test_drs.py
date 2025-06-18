@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from generate import generate, generate_with_drs_research
+from generate import generate, generate_with_drs_improved
 from model.modeling_llada import LLaDAModelLM
 from transformers import AutoTokenizer
 
@@ -88,7 +88,7 @@ def test_drs_hypothesis_validation():
                 )
 
                 # 修正版DRS
-                drs_out, drs_nfe, ambiguity_scores = generate_with_drs_research(
+                drs_out, drs_nfe, ambiguity_scores = generate_with_drs_improved(
                     model, input_ids, steps=total_steps, gen_length=gen_length,
                     block_length=block_length, temperature=0.,
                     threshold=condition['threshold'], t_base=condition['t_base']
