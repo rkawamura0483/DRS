@@ -523,11 +523,6 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
     if any(s > 0 for s in additional_steps):
         print("\nPhase 3: 動的リファインメント開始")
 
-        # リファインメントの前に、一度プレフィックスのKVキャッシュを作成する
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-        nfe += 1
-
         for num_block, steps_to_add in enumerate(additional_steps):
             if steps_to_add == 0:
                 continue
@@ -551,6 +546,15 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                 print(f"    - 再マスク対象なし、高品質のためスキップ")
                 continue
 
+            # リファインメントの前に、一度プレフィックスのKVキャッシュを作成する
+            # これは各ブロックのリファインメントの直前に行うことで、最新の状態を反映する
+            replace_position_prefix = torch.zeros_like(x, dtype=torch.bool)
+            replace_position_prefix[:, :current_block_start] = 1
+            output = model(x[:, :current_block_start], use_cache=True,
+                           replace_position=replace_position_prefix)
+            past_key_values = output.past_key_values
+            nfe += 1
+
             # --- リファインメント実行 ---
             for i in range(steps_to_add):
                 mask_index_block = (
@@ -561,9 +565,9 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
                 nfe += 1
                 # replace_positionはシーケンス全体で定義し、現在のブロックのみTrueにする
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:,
-                                 current_block_start:current_block_end] = True
+                replace_position = torch.zeros(
+                    (1, block_length), dtype=torch.bool, device=x.device)
+                replace_position[:, :] = True
 
                 # モデルには現在のブロックの入力と、プレフィックスのキャッシュを渡す
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
@@ -577,11 +581,6 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                     x[:, current_block_start:current_block_end], num_transfer_tokens
                 )
                 x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
-
-            # このブロックのリファインメントが完了したので、次のブロックのためにKVキャッシュを更新
-            output = model(x, use_cache=True)
-            past_key_values = output.past_key_values
-            nfe += 1
 
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
     print(f"\nDRS生成完了: 総NFE={nfe}, 未生成トークン数={final_masks}")
