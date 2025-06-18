@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer
 from model.modeling_llada import LLaDAModelLM
-from generate import generate_with_drs, generate_with_dual_cache
+from generate import generate_with_dual_cache
 from generate_adaptive import generate_with_adaptive_scheduling, generate_with_custom_scheduler
 from adaptive_scheduler import AdaptiveInferenceScheduler
 from cache_manager import TieredCacheManager
@@ -127,7 +127,6 @@ class AdaptiveSchedulingTester:
 
         methods = {
             "adaptive_scheduling": self._run_adaptive_scheduling,
-            "static_drs": self._run_static_drs,
             "dual_cache": self._run_dual_cache,
         }
 
@@ -272,7 +271,7 @@ class AdaptiveSchedulingTester:
                 long_context_case, seq_length)
 
             # 静的手法（比較用）
-            static_result = self._run_static_drs(long_context_case, seq_length)
+            static_result = self._run_dual_cache(long_context_case, seq_length)
 
             results[seq_length] = {
                 'adaptive': adaptive_result,
@@ -321,37 +320,6 @@ class AdaptiveSchedulingTester:
             'generated_text': generated_text,
             'text_length': len(generated_text),
             'metrics': metrics
-        }
-
-    def _run_static_drs(self, test_case: Dict, gen_length: int) -> Dict[str, Any]:
-        """静的DRSを実行"""
-        prompt = self.tokenizer.encode(
-            test_case['prompt'], return_tensors='pt').to(self.device)
-
-        start_time = time.time()
-        output, nfe, _ = generate_with_drs(
-            model=self.model,
-            prompt=prompt,
-            steps=128,
-            gen_length=gen_length,
-            block_length=32,
-            threshold=0.8,
-            t_base=8
-        )
-        end_time = time.time()
-
-        generated_text = self.tokenizer.decode(
-            output[0, prompt.shape[1]:], skip_special_tokens=True)
-
-        return {
-            'method': 'static_drs',
-            'total_time': end_time - start_time,
-            'nfe': nfe,
-            'adaptations': 0,
-            'avg_block_size': 32,
-            'cache_hit_rate': 0,
-            'generated_text': generated_text,
-            'text_length': len(generated_text)
         }
 
     def _run_dual_cache(self, test_case: Dict, gen_length: int) -> Dict[str, Any]:
