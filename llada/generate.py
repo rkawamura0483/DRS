@@ -15,14 +15,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
-import os
-
-import numpy as np
 import torch
+import numpy as np
 import torch.nn.functional as F
+import os
+from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+
+# ADAPTIVE SCHEDULING INTEGRATION
+try:
+    from .generate_adaptive import generate_with_adaptive_scheduling
+    from .adaptive_scheduler import AdaptiveInferenceScheduler
+    from .cache_manager import TieredCacheManager
+    ADAPTIVE_SCHEDULING_AVAILABLE = True
+except ImportError:
+    ADAPTIVE_SCHEDULING_AVAILABLE = False
 
 
 def add_gumbel_noise(logits, temperature):
@@ -186,7 +194,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
 @torch.no_grad()
 def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                             remasking='low_confidence', mask_id=None, threshold=None):
+                             remasking='low_confidence', mask_id=126336, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -197,15 +205,8 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
+        mask_id: The toke id of [MASK] is 126336.
     '''
-    # mask_idを適切に取得
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -315,423 +316,6 @@ def get_transfer_index_with_confidence(logits, temperature, remasking, mask_inde
     return x0, transfer_index, x0_p
 
 
-def _calculate_ambiguity(confidence_scores, threshold):
-    """
-    ブロックの曖昧度を計算する。
-    信頼度がしきい値を下回るトークンの割合として定義する。
-
-    Args:
-        confidence_scores (Tensor): ブロック内のトークンの信頼度スコア。
-        threshold (float): 信頼度のしきい値。
-
-    Returns:
-        float: 曖昧度スコア (0.0 - 1.0)。
-    """
-    # マスクされておらず、有効な信頼度スコアのみを対象とする
-    valid_scores = confidence_scores[confidence_scores != -np.inf]
-    if valid_scores.numel() == 0:
-        return 0.0  # 有効なトークンがない場合、曖昧度はない
-
-    low_confidence_tokens = (valid_scores < threshold).float()
-    ambiguity_score = low_confidence_tokens.mean().item()
-    return ambiguity_score
-
-
-def allocate_refinement_budget(block_ambiguities, total_refinement_budget):
-    """
-    Allocate refinement budget proportionally to block ambiguity scores.
-
-    Args:
-        block_ambiguities: List of ambiguity scores per block
-        total_refinement_budget: Total additional steps to distribute
-
-    Returns:
-        List of additional steps per block
-    """
-    total_ambiguity = sum(block_ambiguities)
-
-    if total_ambiguity == 0:
-        # No ambiguity, distribute equally if there's any masks left to refine
-        # This part might not be strictly needed if ambiguity is calculated on final blocks
-        steps_per_block = total_refinement_budget // len(block_ambiguities)
-        remainder = total_refinement_budget % len(block_ambiguities)
-        additional_steps = [steps_per_block] * len(block_ambiguities)
-        for i in range(remainder):
-            additional_steps[i] += 1
-        return additional_steps
-
-    # Proportional allocation
-    additional_steps = [0] * len(block_ambiguities)
-    for i in range(total_refinement_budget):
-        proportions = [amb / total_ambiguity for amb in block_ambiguities]
-        most_ambiguous_block = proportions.index(max(proportions))
-        additional_steps[most_ambiguous_block] += 1
-        # To avoid one block taking all, we can reduce its ambiguity after allocation
-        # For simplicity, we stick to proportional allocation of the total budget at once.
-
-    proportions = [amb / total_ambiguity for amb in block_ambiguities]
-    additional_steps = [round(p * total_refinement_budget)
-                        for p in proportions]
-
-    # Adjust to match total budget due to rounding
-    current_total = sum(additional_steps)
-    diff = total_refinement_budget - current_total
-    if diff != 0:
-        # Distribute remainder/deficit to most/least ambiguous blocks
-        sort_order = sorted(range(len(block_ambiguities)),
-                            key=lambda k: block_ambiguities[k], reverse=(diff > 0))
-        for i in range(abs(diff)):
-            additional_steps[sort_order[i %
-                                        len(sort_order)]] += (1 if diff > 0 else -1)
-
-    return additional_steps
-
-
-def allocate_refinement_budget_uniformly(block_ambiguities, total_refinement_budget):
-    """
-    リファインメント予算を、ゼロでない曖昧度を持つブロックに均等に割り当てる。
-    これは比例配分に対するコントロールとして機能する。
-    """
-    ambiguous_blocks = [i for i, amb in enumerate(
-        block_ambiguities) if amb > 0]
-    additional_steps = [0] * len(block_ambiguities)
-
-    if not ambiguous_blocks:
-        return additional_steps
-
-    steps_per_block = total_refinement_budget // len(ambiguous_blocks)
-    remainder = total_refinement_budget % len(ambiguous_blocks)
-
-    for i in ambiguous_blocks:
-        additional_steps[i] = steps_per_block
-
-    for i in range(remainder):
-        additional_steps[ambiguous_blocks[i]] += 1
-
-    return additional_steps
-
-
-@torch.no_grad()
-def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128,
-                      temperature=0., remasking='low_confidence', mask_id=None,
-                      threshold=0.8, t_base=8):
-    """
-    Dynamic Refinement Steps (DRS) 実装
-    generate_with_dual_cacheをベースに、DRS仮説（動的予算配分＋リファインメント）のみを追加
-    """
-    # マスクIDの取得（generate_with_dual_cacheと同じ）
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
-    # 初期化（generate_with_dual_cacheと同じ）
-    x = torch.full((1, prompt.shape[1] + gen_length),
-                   mask_id, dtype=torch.long).to(model.device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-
-    nfe = 0
-    block_confidences = []  # DRS用：各ブロックの最終信頼度
-
-    # ======== フェーズ1: 初期生成（Fast-dLLM + 信頼度収集）========
-    print(f"Phase 1: 初期生成 (t_base={t_base} per block)")
-
-    for num_block in range(num_blocks):
-        current_block_start = prompt.shape[1] + num_block * block_length
-        current_block_end = current_block_start + block_length
-
-        block_mask_index = (
-            x[:, current_block_start:current_block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
-
-        # 初期化：generate_with_dual_cacheと完全に同じパターン
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-        mask_index = (x == mask_id)
-        mask_index[:, current_block_end:] = 0
-        x0, transfer_index = get_transfer_index(
-            output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0])
-        x[transfer_index] = x0[transfer_index]
-        nfe += 1
-
-        # ブロック内反復：generate_with_dual_cacheと完全に同じパターン
-        i = 1
-        replace_position = torch.zeros_like(x, dtype=torch.bool)
-        replace_position[:, current_block_start:current_block_end] = 1
-        while True:
-            nfe += 1
-            mask_index = (
-                x[:, current_block_start:current_block_end] == mask_id)
-            if mask_index.sum() == 0 or i >= t_base:
-                break
-
-            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                           use_cache=True, replace_position=replace_position).logits
-
-            x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
-                                                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i])
-            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-            i += 1
-
-        # DRS追加：ブロックの最終信頼度を記録
-        if mask_index.sum() == 0:  # ブロックが完了した場合のみ
-            final_logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                                 use_cache=True, replace_position=replace_position).logits
-            nfe += 1
-            p = F.softmax(final_logits.to(torch.float64), dim=-1)
-            final_tokens = x[:, current_block_start:current_block_end]
-            confidence = torch.gather(
-                p, dim=-1, index=final_tokens.unsqueeze(-1)).squeeze(-1)
-            block_confidences.append(confidence[0])
-        else:
-            # ブロックが未完了の場合は低信頼度とみなす
-            block_confidences.append(torch.full(
-                (block_length,), 0.5, device=x.device))
-
-    # ======== フェーズ2: DRS予算配分 ========
-    t_used = nfe
-    t_remaining = max(0, steps - t_used)
-    print(f"\nPhase 2: DRS予算配分 (使用済み: {t_used}, 残り: {t_remaining})")
-
-    if t_remaining <= 0:
-        print("  → 予算なし、初期生成のみで終了")
-        ambiguity_scores = [_calculate_ambiguity(
-            conf, threshold) for conf in block_confidences]
-        return x, nfe, ambiguity_scores
-
-    # 各ブロックの曖昧度計算
-    ambiguity_scores = [_calculate_ambiguity(
-        conf, threshold) for conf in block_confidences]
-    print(f"  ブロック曖昧度: {[f'{s:.3f}' for s in ambiguity_scores]}")
-
-    # 予算配分
-    additional_steps = allocate_refinement_budget(
-        ambiguity_scores, t_remaining)
-    print(f"  → 追加ステップ配分: {additional_steps}")
-
-    # ======== フェーズ3: DRSリファインメント ========
-    if any(s > 0 for s in additional_steps):
-        print("\nPhase 3: DRSリファインメント")
-
-        for num_block, extra_steps in enumerate(additional_steps):
-            if extra_steps == 0:
-                continue
-
-            print(f"  → ブロック {num_block}: {extra_steps} ステップ追加")
-            current_block_start = prompt.shape[1] + num_block * block_length
-            current_block_end = current_block_start + block_length
-
-            # 低信頼度トークンの再マスク
-            current_confidence = block_confidences[num_block]
-            remask_indices = current_confidence < threshold
-            num_remasked = remask_indices.sum().item()
-
-            if num_remasked == 0:
-                print(f"    - 再マスク対象なし、スキップ")
-                continue
-
-            print(f"    - {num_remasked}個のトークンを再マスク")
-            x[:, current_block_start:current_block_end][remask_indices.unsqueeze(
-                0)] = mask_id
-
-            # リファインメント実行：generate_with_dual_cacheパターンを再利用
-            output = model(x, use_cache=True)
-            past_key_values = output.past_key_values
-            nfe += 1
-
-            replace_position = torch.zeros_like(x, dtype=torch.bool)
-            replace_position[:, current_block_start:current_block_end] = 1
-
-            for step in range(extra_steps):
-                mask_index = (
-                    x[:, current_block_start:current_block_end] == mask_id)
-                if mask_index.sum() == 0:
-                    print(f"    - {step+1} ステップで完了")
-                    break
-
-                nfe += 1
-                logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                               use_cache=True, replace_position=replace_position).logits
-
-                # 残りステップに応じてトークン数を調整
-                remaining_steps = extra_steps - step
-                num_transfer_tokens = get_num_transfer_tokens(
-                    mask_index, remaining_steps)[:, 0]
-
-                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
-                                                        x[:, current_block_start:current_block_end], num_transfer_tokens)
-                x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-
-    final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
-    print(f"\nDRS完了: 総NFE={nfe}, 未生成トークン={final_masks}")
-
-    # 最終的な曖昧度スコアを返す
-    final_ambiguity_scores = [_calculate_ambiguity(
-        conf, threshold) for conf in block_confidences]
-    return x, nfe, final_ambiguity_scores
-
-
-@torch.no_grad()
-def generate_with_drs_uniform_allocation(model, prompt, steps=128, gen_length=128, block_length=128,
-                                         temperature=0., remasking='low_confidence', mask_id=None,
-                                         threshold=0.8, t_base=8):
-    """
-    DRS with Uniform Allocation (Control Experiment).
-    A version of DRS that allocates the refinement budget *uniformly* across all
-    ambiguous blocks, instead of proportionally. This helps isolate the impact
-    of the dynamic allocation strategy itself.
-    """
-    # マスクIDの取得（generate_with_drsと同じ）
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
-    # 初期化（generate_with_drsと同じ）
-    x = torch.full((1, prompt.shape[1] + gen_length),
-                   mask_id, dtype=torch.long).to(model.device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-
-    nfe = 0
-    block_confidences = []
-
-    # ======== フェーズ1: 初期生成 ========
-    print(f"Phase 1: 初期生成 (t_base={t_base} per block)")
-
-    for num_block in range(num_blocks):
-        current_block_start = prompt.shape[1] + num_block * block_length
-        current_block_end = current_block_start + block_length
-
-        block_mask_index = (
-            x[:, current_block_start:current_block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
-
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-        mask_index = (x == mask_id)
-        mask_index[:, current_block_end:] = 0
-        x0, transfer_index = get_transfer_index(
-            output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0])
-        x[transfer_index] = x0[transfer_index]
-        nfe += 1
-
-        i = 1
-        replace_position = torch.zeros_like(x, dtype=torch.bool)
-        replace_position[:, current_block_start:current_block_end] = 1
-        while True:
-            nfe += 1
-            mask_index = (
-                x[:, current_block_start:current_block_end] == mask_id)
-            if mask_index.sum() == 0 or i >= t_base:
-                break
-
-            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                           use_cache=True, replace_position=replace_position).logits
-
-            x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
-                                                    x[:, current_block_start:current_block_end], num_transfer_tokens[:, i])
-            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-            i += 1
-
-        if mask_index.sum() == 0:
-            final_logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                                 use_cache=True, replace_position=replace_position).logits
-            nfe += 1
-            p = F.softmax(final_logits.to(torch.float64), dim=-1)
-            final_tokens = x[:, current_block_start:current_block_end]
-            confidence = torch.gather(
-                p, dim=-1, index=final_tokens.unsqueeze(-1)).squeeze(-1)
-            block_confidences.append(confidence[0])
-        else:
-            block_confidences.append(torch.full(
-                (block_length,), 0.5, device=x.device))
-
-    # ======== フェーズ2: DRS予算配分 (Uniform) ========
-    t_used = nfe
-    t_remaining = max(0, steps - t_used)
-    print(f"\nPhase 2: DRS Uniform予算配分 (使用済み: {t_used}, 残り: {t_remaining})")
-
-    if t_remaining <= 0:
-        print("  → 予算なし、初期生成のみで終了")
-        ambiguity_scores = [_calculate_ambiguity(
-            conf, threshold) for conf in block_confidences]
-        return x, nfe, ambiguity_scores
-
-    ambiguity_scores = [_calculate_ambiguity(
-        conf, threshold) for conf in block_confidences]
-    print(f"  ブロック曖昧度: {[f'{s:.3f}' for s in ambiguity_scores]}")
-
-    # ★★★ コントロール実験の核心部 ★★★
-    additional_steps = allocate_refinement_budget_uniformly(
-        ambiguity_scores, t_remaining)
-    print(f"  → 追加ステップ配分 (Uniform): {additional_steps}")
-
-    # ======== フェーズ3: DRSリファインメント ========
-    if any(s > 0 for s in additional_steps):
-        print("\nPhase 3: DRSリファインメント")
-
-        for num_block, extra_steps in enumerate(additional_steps):
-            if extra_steps == 0:
-                continue
-
-            print(f"  → ブロック {num_block}: {extra_steps} ステップ追加")
-            current_block_start = prompt.shape[1] + num_block * block_length
-            current_block_end = current_block_start + block_length
-
-            current_confidence = block_confidences[num_block]
-            remask_indices = current_confidence < threshold
-            num_remasked = remask_indices.sum().item()
-
-            if num_remasked == 0:
-                print(f"    - 再マスク対象なし、スキップ")
-                continue
-
-            print(f"    - {num_remasked}個のトークンを再マスク")
-            x[:, current_block_start:current_block_end][remask_indices.unsqueeze(
-                0)] = mask_id
-
-            output = model(x, use_cache=True)
-            past_key_values = output.past_key_values
-            nfe += 1
-
-            replace_position = torch.zeros_like(x, dtype=torch.bool)
-            replace_position[:, current_block_start:current_block_end] = 1
-
-            for step in range(extra_steps):
-                mask_index = (
-                    x[:, current_block_start:current_block_end] == mask_id)
-                if mask_index.sum() == 0:
-                    print(f"    - {step+1} ステップで完了")
-                    break
-
-                nfe += 1
-                logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                               use_cache=True, replace_position=replace_position).logits
-
-                remaining_steps = extra_steps - step
-                num_transfer_tokens = get_num_transfer_tokens(
-                    mask_index, remaining_steps)[:, 0]
-
-                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
-                                                        x[:, current_block_start:current_block_end], num_transfer_tokens)
-                x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-
-    final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
-    print(f"\nDRS Uniform完了: 総NFE={nfe}, 未生成トークン={final_masks}")
-
-    final_ambiguity_scores = [_calculate_ambiguity(
-        conf, threshold) for conf in block_confidences]
-    return x, nfe, final_ambiguity_scores
-
-
 def main():
     device = 'cuda'
 
@@ -739,13 +323,6 @@ def main():
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-    model.tokenizer = tokenizer  # モデルにトークナイザーをセット
-
-    # mask_idを確実に取得
-    mask_id = tokenizer.mask_token_id
-    if mask_id is None:
-        mask_id = model.config.mask_token_id
-        print(f"トークナイザーのmask_token_idがNoneのため、モデル設定から取得: {mask_id}")
 
     prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
 
@@ -757,10 +334,152 @@ def main():
     input_ids = tokenizer(prompt)['input_ids']
     input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-    out, nfe = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128,
-                                        block_length=32, temperature=0., remasking='low_confidence', mask_id=mask_id)
+    out = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128,
+                                   block_length=32, temperature=0., remasking='low_confidence')
     print(tokenizer.batch_decode(
         out[0][:, input_ids.shape[1]:], skip_special_tokens=True)[0])
+
+
+# ============= ADAPTIVE SCHEDULING INTEGRATION =============
+
+@torch.no_grad()
+def generate_adaptive(model, prompt, gen_length=128, base_block_size=16,
+                      base_confidence_threshold=0.8, adaptation_rate=0.2,
+                      enable_tiered_cache=True, temperature=0.,
+                      remasking='low_confidence', mask_id=None, verbose=False):
+    """
+    アダプティブスケジューリング統合関数
+
+    既存のgenerate関数群と同じインターフェースで、
+    Self-Correcting Adaptive Inference Schedulingを使用した生成を提供。
+
+    Args:
+        model: LLaDAモデル
+        prompt: 入力プロンプト
+        gen_length: 生成長
+        base_block_size: 初期ブロックサイズ
+        base_confidence_threshold: 初期信頼度閾値
+        adaptation_rate: 適応率
+        enable_tiered_cache: 階層キャッシュを有効にするか
+        temperature: サンプリング温度
+        remasking: リマスキング戦略
+        mask_id: マスクトークンID
+        verbose: 詳細出力
+
+    Returns:
+        (生成されたテンソル, NFE数) - 既存関数と同じ形式
+    """
+    if not ADAPTIVE_SCHEDULING_AVAILABLE:
+        print("⚠️ アダプティブスケジューリングが利用できません。")
+        print("   代わりにgenerate_with_dual_cacheを使用します。")
+        return generate_with_dual_cache(
+            model, prompt, steps=128, gen_length=gen_length,
+            block_length=base_block_size, temperature=temperature,
+            remasking=remasking, mask_id=mask_id
+        )
+
+    # アダプティブスケジューリングで生成
+    output, metrics = generate_with_adaptive_scheduling(
+        model=model,
+        prompt=prompt,
+        gen_length=gen_length,
+        base_block_size=base_block_size,
+        base_confidence_threshold=base_confidence_threshold,
+        adaptation_rate=adaptation_rate,
+        enable_tiered_cache=enable_tiered_cache,
+        temperature=temperature,
+        remasking=remasking,
+        mask_id=mask_id,
+        verbose=verbose
+    )
+
+    # 既存インターフェースに合わせて返り値を調整
+    return output, metrics['nfe']
+
+
+@torch.no_grad()
+def compare_generation_methods(model, prompt, gen_length=128, verbose=True):
+    """
+    各生成手法の比較を実行
+
+    Args:
+        model: LLaDAモデル
+        prompt: 入力プロンプト
+        gen_length: 生成長
+        verbose: 詳細出力
+
+    Returns:
+        比較結果の辞書
+    """
+    import time
+
+    results = {}
+
+    if verbose:
+        print("🔍 生成手法比較開始")
+        print("=" * 50)
+
+    # 1. 標準的なgenerate_with_dual_cache
+    if verbose:
+        print("📊 generate_with_dual_cache 実行中...")
+
+    start_time = time.time()
+    dual_cache_output, dual_cache_nfe = generate_with_dual_cache(
+        model, prompt, steps=128, gen_length=gen_length,
+        block_length=32, temperature=0., remasking='low_confidence'
+    )
+    dual_cache_time = time.time() - start_time
+
+    results['dual_cache'] = {
+        'output': dual_cache_output,
+        'nfe': dual_cache_nfe,
+        'time': dual_cache_time,
+        'method': 'Dual Cache (Static)'
+    }
+
+    # 2. アダプティブスケジューリング
+    if ADAPTIVE_SCHEDULING_AVAILABLE:
+        if verbose:
+            print("🚀 adaptive scheduling 実行中...")
+
+        start_time = time.time()
+        adaptive_output, adaptive_nfe = generate_adaptive(
+            model, prompt, gen_length=gen_length,
+            verbose=False
+        )
+        adaptive_time = time.time() - start_time
+
+        results['adaptive'] = {
+            'output': adaptive_output,
+            'nfe': adaptive_nfe,
+            'time': adaptive_time,
+            'method': 'Adaptive Scheduling'
+        }
+
+        # 比較メトリクス
+        speedup = dual_cache_time / adaptive_time if adaptive_time > 0 else 0
+        nfe_reduction = (dual_cache_nfe - adaptive_nfe) / \
+            dual_cache_nfe if dual_cache_nfe > 0 else 0
+
+        results['comparison'] = {
+            'speedup': speedup,
+            'nfe_reduction_percent': nfe_reduction * 100,
+            'adaptive_faster': adaptive_time < dual_cache_time
+        }
+
+        if verbose:
+            print(f"\n📈 比較結果:")
+            print(
+                f"   Dual Cache: {dual_cache_time:.2f}s, NFE={dual_cache_nfe}")
+            print(f"   Adaptive:   {adaptive_time:.2f}s, NFE={adaptive_nfe}")
+            print(f"   スピードアップ: {speedup:.2f}x")
+            print(f"   NFE削減: {nfe_reduction*100:.1f}%")
+
+    else:
+        if verbose:
+            print("⚠️ アダプティブスケジューリングは利用できません")
+
+    return results
 
 
 if __name__ == '__main__':
