@@ -555,22 +555,21 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
             current_block_start = prompt.shape[1] + num_block * block_length
             current_block_end = current_block_start + block_length
 
-            # --- 新しい統一リファインメントロジック ---
-            # Step 1: 精錬対象のマスクを決定
-            block_x = x[:, current_block_start:current_block_end]
-            is_masked = (block_x == mask_id)
+            # 🔑 改善: 完成ブロックでも曖昧度が高い場合は品質向上精錬を実行
+            block_mask_index = (
+                x[:, current_block_start:current_block_end] == mask_id)
 
-            if is_masked.sum().item() == 0:
-                # 完成ブロックだが曖昧度が高い場合、低信頼度トークンを再マスク
-                print(f"  精錬理由: ブロック {num_block} の信頼度ベース品質向上")
+            if block_mask_index.sum().item() > 0:
+                # 既存マスクがある場合の通常精錬
+                print(
+                    f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
+            else:
+                # 🔑 新機能: 完成ブロックの品質向上精錬
+                print(
+                    f"  → ブロック {num_block} の品質向上精錬を実行（曖昧度: {block_confidences[num_block]:.3f}）")
 
-                # 🔑 修正: KVキャッシュの準備を修正
-                # フルシーケンスで再計算して最新の状態を取得
+                # 低信頼度トークンを特定して再マスク
                 output = model(x, use_cache=True)
-                past_key_values_refine = output.past_key_values
-                nfe += 1
-
-                # ブロック部分の信頼度を評価
                 block_logits = output.logits[:,
                                              current_block_start:current_block_end]
                 p = F.softmax(block_logits.to(torch.float64), dim=-1)
@@ -578,81 +577,75 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                 current_confidence = torch.gather(
                     p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
 
-                low_conf_mask = current_confidence < threshold
-                if low_conf_mask.sum().item() == 0:
-                    print(
-                        f"    ブロック {num_block} は信頼度が高いためスキップします (最低信頼度: {current_confidence.min().item():.3f})。")
+                # 動的な再マスク閾値（保守的）
+                remask_threshold = max(threshold * 0.8, 0.5)  # より慎重な再マスク
+                low_conf_mask = current_confidence < remask_threshold
+
+                if low_conf_mask.sum().item() > 0:
+                    # 低信頼度トークンを再マスク
+                    x[:, current_block_start:current_block_end][low_conf_mask] = mask_id
+                    print(f"    → {low_conf_mask.sum().item()}個の低信頼度トークンを再マスク")
+
+                    # 新しいマスクインデックスを設定
+                    block_mask_index = (
+                        x[:, current_block_start:current_block_end] == mask_id)
+                    nfe += 1
+                else:
+                    print(f"    → ブロック {num_block} は十分高品質のためスキップ")
                     continue
 
-                x[:, current_block_start:current_block_end][low_conf_mask] = mask_id
+            # 共通精錬処理
+            if block_mask_index.sum().item() > 0:
+                # 既存マスクがある場合の通常精錬
                 print(
-                    f"    → ブロック {num_block} の {low_conf_mask.sum().item()} 個の低信頼度トークンを再マスクしました。")
-            else:
-                print(f"  精錬理由: ブロック {num_block} の残存マスクの品質向上")
-                # 既存マスクがある場合もKVキャッシュを準備
+                    f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
+
+                # KVキャッシュ準備
                 output = model(x, use_cache=True)
                 past_key_values_refine = output.past_key_values
                 nfe += 1
 
-            # Step 2: マスクを含むブロックを精錬
-            block_mask_index = (
-                x[:, current_block_start:current_block_end] == mask_id)
-            if block_mask_index.sum().item() == 0:
-                continue
+                # プレフィックス部分のみ保持
+                new_past_key_values = []
+                for i in range(len(past_key_values_refine)):
+                    new_past_key_values.append(())
+                    for j in range(len(past_key_values_refine[i])):
+                        new_past_key_values[i] += (past_key_values_refine[i]
+                                                   [j][:, :, :current_block_start],)
+                past_key_values_refine = new_past_key_values
 
-            num_transfer_tokens_refine = get_num_transfer_tokens(
-                block_mask_index, steps_to_add)
+                num_transfer_tokens_refine = get_num_transfer_tokens(
+                    block_mask_index, steps_to_add)
 
-            print(
-                f"  → ブロック {num_block} を {steps_to_add} ステップで精錬...")
+                replace_pos_refine = torch.zeros(
+                    (1, block_length), dtype=torch.bool, device=x.device)
+                replace_pos_refine[:, :] = 1
 
-            # 🔑 修正: KVキャッシュの更新処理を修正
-            # プレフィックス部分のみを保持（現在のブロック以降を削除）
-            new_past_key_values = []
-            for i in range(len(past_key_values_refine)):
-                new_past_key_values.append(())
-                for j in range(len(past_key_values_refine[i])):
-                    new_past_key_values[i] += (past_key_values_refine[i]
-                                               [j][:, :, :current_block_start],)
-            past_key_values_refine = new_past_key_values
+                for i in range(steps_to_add):
+                    if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
+                        print(f"    ブロック {num_block} の精錬完了")
+                        break
 
-            # リファインメントループ
-            # 🔑 修正: replace_positionをブロック用に調整
-            replace_pos_refine = torch.zeros(
-                (1, block_length), dtype=torch.bool, device=x.device)
-            replace_pos_refine[:, :] = 1  # ブロック全体が対象
+                    nfe += 1
 
-            for i in range(steps_to_add):
-                if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
-                    print(f"    ブロック {num_block} の精錬完了 (早期終了)")
-                    break
+                    logits = model(x[:, current_block_start:current_block_end],
+                                   past_key_values=past_key_values_refine,
+                                   use_cache=True,
+                                   replace_position=replace_pos_refine).logits
 
-                nfe += 1
+                    refine_mask_index = (
+                        x[:, current_block_start:current_block_end] == mask_id)
 
-                logits = model(x[:, current_block_start:current_block_end],
-                               past_key_values=past_key_values_refine,
-                               use_cache=True,
-                               replace_position=replace_pos_refine).logits
+                    tokens_to_transfer = (num_transfer_tokens_refine[:, i] if i < num_transfer_tokens_refine.shape[1]
+                                          else refine_mask_index.sum(dim=1, keepdim=True))
 
-                refine_mask_index = (
-                    x[:, current_block_start:current_block_end] == mask_id)
+                    x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
+                        logits, temperature, remasking, refine_mask_index,
+                        x[:, current_block_start:current_block_end], tokens_to_transfer)
 
-                # インデックス安全性チェック
-                if i < num_transfer_tokens_refine.shape[1]:
-                    tokens_to_transfer = num_transfer_tokens_refine[:, i]
-                else:
-                    # 残りマスク数を使用
-                    tokens_to_transfer = refine_mask_index.sum(
-                        dim=1, keepdim=True)
-
-                x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
-                    logits, temperature, remasking, refine_mask_index,
-                    x[:, current_block_start:current_block_end],
-                    tokens_to_transfer)
-
-                x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
-    else:
-        print(f"\nPhase 3: スキップ（追加ステップなし）")
+                    x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
+            else:
+                print(f"  → ブロック {num_block} は完成済み。品質保護のため精錬スキップ")
 
     # 最終結果
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
@@ -797,7 +790,7 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
 
     # より保守的な追加ステップ配分（曖昧度が高いブロックのみ）
     high_ambiguity_blocks = [i for i, score in enumerate(
-        block_confidences) if score > 0.2]
+        block_confidences) if score > 0.15]  # 閾値を0.2→0.15に緩和
 
     if len(high_ambiguity_blocks) == 0:
         print("  → 高曖昧度ブロックなし。追加精錬をスキップ")
@@ -806,8 +799,8 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
     additional_steps = allocate_refinement_budget(block_confidences, t_refine)
     print(f"  → 追加ステップ配分: {additional_steps}")
 
-    # Phase 3: 非破壊的精錬（品質保持優先）
-    print(f"\nPhase 3: 保守的精錬開始")
+    # Phase 3: 改善版精錬（品質向上優先）
+    print(f"\nPhase 3: 改善版精錬開始")
 
     for num_block, steps_to_add in enumerate(additional_steps):
         if steps_to_add == 0 or num_block not in high_ambiguity_blocks:
@@ -816,12 +809,48 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        # 🔑 改善: 既存マスクのみを対象にし、完成トークンは保護
+        # 🔑 改善: 完成ブロックでも曖昧度が高い場合は品質向上精錬を実行
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
 
         if block_mask_index.sum().item() > 0:
-            # 既存マスクがある場合のみ精錬
+            # 既存マスクがある場合の通常精錬
+            print(
+                f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
+        else:
+            # 🔑 新機能: 完成ブロックの品質向上精錬
+            print(
+                f"  → ブロック {num_block} の品質向上精錬を実行（曖昧度: {block_confidences[num_block]:.3f}）")
+
+            # 低信頼度トークンを特定して再マスク
+            output = model(x, use_cache=True)
+            block_logits = output.logits[:,
+                                         current_block_start:current_block_end]
+            p = F.softmax(block_logits.to(torch.float64), dim=-1)
+            current_tokens = x[:, current_block_start:current_block_end]
+            current_confidence = torch.gather(
+                p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
+
+            # 動的な再マスク閾値（保守的）
+            remask_threshold = max(threshold * 0.8, 0.5)  # より慎重な再マスク
+            low_conf_mask = current_confidence < remask_threshold
+
+            if low_conf_mask.sum().item() > 0:
+                # 低信頼度トークンを再マスク
+                x[:, current_block_start:current_block_end][low_conf_mask] = mask_id
+                print(f"    → {low_conf_mask.sum().item()}個の低信頼度トークンを再マスク")
+
+                # 新しいマスクインデックスを設定
+                block_mask_index = (
+                    x[:, current_block_start:current_block_end] == mask_id)
+                nfe += 1
+            else:
+                print(f"    → ブロック {num_block} は十分高品質のためスキップ")
+                continue
+
+        # 共通精錬処理
+        if block_mask_index.sum().item() > 0:
+            # 既存マスクがある場合の通常精錬
             print(
                 f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
 

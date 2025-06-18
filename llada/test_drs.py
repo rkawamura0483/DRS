@@ -190,7 +190,12 @@ def test_improved_drs_validation():
 
             # より適切なテスト条件
             test_conditions = [
-                {'t_base': 4, 'threshold': 0.7, 'name': '適度な条件'},
+                {'t_base': 8, 'threshold': 0.9, 'name': '8, 0.9'},
+                {'t_base': 4, 'threshold': 0.9, 'name': '4, 0.9'},
+                {'t_base': 2, 'threshold': 0.9, 'name': '2, 0.9'},
+                {'t_base': 8, 'threshold': 0.7, 'name': '8, 0.7'},
+                {'t_base': 4, 'threshold': 0.7, 'name': '4, 0.7'},
+                {'t_base': 2, 'threshold': 0.7, 'name': '2, 0.7'},
             ]
 
             for condition in test_conditions:
