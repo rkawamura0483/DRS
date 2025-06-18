@@ -102,6 +102,13 @@ class AdaptiveInferenceScheduler:
         Returns:
             平均エントロピー
         """
+        # 形状の整合性を確認
+        if logits.shape[:2] != mask_index.shape:
+            # 最小の次元に合わせる
+            min_seq_len = min(logits.shape[1], mask_index.shape[1])
+            logits = logits[:, :min_seq_len]
+            mask_index = mask_index[:, :min_seq_len]
+
         # マスクされた位置のみのロジットを取得
         masked_logits = logits[mask_index]
         if masked_logits.numel() == 0:
@@ -122,9 +129,9 @@ class AdaptiveInferenceScheduler:
         信頼度メトリクスを計算
 
         Args:
-            logits: モデルの出力ロジット
-            tokens: 生成されたトークン
-            mask_index: マスクされた位置のインデックス
+            logits: モデルの出力ロジット（ブロック分のみ）
+            tokens: 生成されたトークン（ブロック分のみ）
+            mask_index: マスクされた位置のインデックス（ブロック分のみ）
 
         Returns:
             (平均信頼度, エントロピー)
@@ -135,6 +142,15 @@ class AdaptiveInferenceScheduler:
         # 信頼度を計算
         if not mask_index.any():
             return 0.0, entropy
+
+        # logits、tokens、mask_indexの形状を確認して整合性を保つ
+        if logits.shape[1] != tokens.shape[1] or tokens.shape[1] != mask_index.shape[1]:
+            # 形状が一致しない場合、最小の次元に合わせる
+            min_seq_len = min(
+                logits.shape[1], tokens.shape[1], mask_index.shape[1])
+            logits = logits[:, :min_seq_len]
+            tokens = tokens[:, :min_seq_len]
+            mask_index = mask_index[:, :min_seq_len]
 
         probs = F.softmax(logits.to(torch.float64), dim=-1)
         token_probs = torch.gather(
