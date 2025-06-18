@@ -63,7 +63,7 @@ def get_num_transfer_tokens(mask_index, steps):
 
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=None, threshold=None):
+             remasking='low_confidence', mask_id=126336, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -74,15 +74,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
+        mask_id: The toke id of [MASK] is 126336.
     '''
-    # mask_idを適切に取得
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -116,7 +109,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
 
 @torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                               remasking='low_confidence', mask_id=None, threshold=None):
+                               remasking='low_confidence', mask_id=126336, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -127,15 +120,8 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
+        mask_id: The toke id of [MASK] is 126336.
     '''
-    # mask_idを適切に取得
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -200,7 +186,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
 @torch.no_grad()
 def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                             remasking='low_confidence', mask_id=None, threshold=None):
+                             remasking='low_confidence', mask_id=126336, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -211,15 +197,8 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
+        mask_id: The toke id of [MASK] is 126336.
     '''
-    # mask_idを適切に取得
-    if mask_id is None:
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
-            mask_id = model.tokenizer.mask_token_id
-        else:
-            mask_id = model.config.mask_token_id
-
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -263,8 +242,7 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
             x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
                                                     x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-            # Fast-dLLMアルゴリズムに従い、マスクが全て除去されるかステップ数上限に達したら終了
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0 or i >= steps:
+            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
                 break
             i += 1
 
