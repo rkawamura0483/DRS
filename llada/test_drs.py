@@ -6,7 +6,7 @@ from collections import Counter
 import numpy as np
 import torch
 import torch.nn.functional as F
-from generate import generate, generate_with_conservative_drs
+from generate import generate_with_drs, generate_with_dual_cache
 from model.modeling_llada import LLaDAModelLM
 from transformers import AutoTokenizer
 
@@ -160,12 +160,12 @@ def enhanced_ambiguity_calculation_with_context(confidence_scores, threshold, pr
     return combined_ambiguity
 
 
-def test_enhanced_drs_validation():
-    """大幅改善版DRS検証システム"""
+def test_drs_validation():
+    """DRS仮説検証システム"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🔬 大幅改善版DRS検証開始 (デバイス: {device})")
+    print(f"🔬 DRS仮説検証開始 (デバイス: {device})")
 
-    # より厳選されたテストプロンプト
+    # 検証用プロンプト
     test_prompts = [
         "Calculate the area of a rectangular garden with length 15 meters and width 8 meters.",
         "Write a Python function to find the factorial of a number using recursion.",
@@ -189,10 +189,8 @@ def test_enhanced_drs_validation():
         mask_id = tokenizer.mask_token_id or model.config.mask_token_id or 126336
         print(f"✅ モデルロード完了 (mask_id={mask_id})")
 
-        # 改善された品質評価器の初期化
         evaluator = ImprovedQualityEvaluator(tokenizer)
 
-        # より実用的で安全なテスト設定
         gen_length = 256
         block_length = 32
         total_steps = 128
@@ -210,128 +208,107 @@ def test_enhanced_drs_validation():
             input_ids = tokenizer(prompt_formatted)['input_ids']
             input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-            # 品質重視の厳格なテスト条件
+            # --- ベースライン (fast-dLLM) ---
+            print("\n🎯 ベースライン (fast-dLLM: generate_with_dual_cache) 生成中...")
+            baseline_out, baseline_nfe = generate_with_dual_cache(
+                model, input_ids, steps=total_steps, gen_length=gen_length,
+                block_length=block_length, temperature=0., remasking='low_confidence',
+                mask_id=mask_id
+            )
+            baseline_text = tokenizer.batch_decode(
+                baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
+
+            # --- 提案手法 (DRS) ---
+            # DRSのパラメータ設定を変えて実験
             test_conditions = [
-                {'t_base': 12, 'threshold': 0.95, 'name': '超保守的設定'},  # 最高品質重視
-                {'t_base': 10, 'threshold': 0.92, 'name': '高品質設定'},   # 高品質
-                {'t_base': 8, 'threshold': 0.90, 'name': 'バランス設定'},   # バランス
+                {'t_base': 16, 'threshold': 0.9,
+                    'name': 'DRS (t_base=16, 品質重視)'},
+                {'t_base': 8, 'threshold': 0.8,
+                    'name': 'DRS (t_base=8, バランス)'},
+                {'t_base': 4, 'threshold': 0.7,
+                    'name': 'DRS (t_base=4, 速度重視)'},
             ]
 
             for condition in test_conditions:
                 print(f"\n{'-'*60}")
-                print(
-                    f"🧪 {condition['name']} (t_base={condition['t_base']}, threshold={condition['threshold']})")
+                print(f"🧪 {condition['name']}")
                 print(f"{'-'*60}")
 
-                # ベースライン生成
-                print("🎯 ベースライン生成中...")
-                baseline_out, baseline_nfe = generate(
-                    model, input_ids, steps=total_steps, gen_length=gen_length,
-                    block_length=block_length, temperature=0., remasking='low_confidence',
-                    mask_id=mask_id
-                )
-
-                # 保守的DRS生成
-                print("⚡ 大幅改善版DRS生成中...")
-                drs_out, drs_nfe, ambiguity_scores = generate_with_conservative_drs(
+                print("⚡ DRS (generate_with_drs) 生成中...")
+                drs_out, drs_nfe, ambiguity_scores = generate_with_drs(
                     model, input_ids, steps=total_steps, gen_length=gen_length,
                     block_length=block_length, temperature=0.,
                     threshold=condition['threshold'], t_base=condition['t_base'],
                     mask_id=mask_id
                 )
-
-                # テキスト抽出
-                baseline_text = tokenizer.batch_decode(
-                    baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
                 drs_text = tokenizer.batch_decode(
                     drs_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
-                # 大幅改善された品質評価
+                # 品質評価
                 drs_quality, quality_details = evaluator.comprehensive_quality_score(
                     prompt, baseline_text, drs_text)
 
                 # NFE効率
-                nfe_reduction = ((baseline_nfe - drs_nfe) / baseline_nfe) * 100
-
-                # 曖昧度分析
-                max_ambiguity = max(
-                    ambiguity_scores) if ambiguity_scores else 0
-                ambiguity_variance = np.var(
-                    ambiguity_scores) if ambiguity_scores else 0
-                meaningful_blocks = sum(
-                    1 for score in ambiguity_scores if score > 0.15)
+                # NFEは必ずしも削減されるわけではなく、同程度の予算で品質向上を目指す
+                nfe_diff = drs_nfe - baseline_nfe
 
                 # 詳細な結果出力
                 print(f"\n📊 詳細結果:")
-                print(f"  🎯 ベースライン:")
+                print(f"  🎯 ベースライン (fast-dLLM):")
                 print(f"     NFE: {baseline_nfe}")
                 print(f"     テキスト: {baseline_text[:200]}...")
-                print(f"  ⚡ 大幅改善版DRS:")
-                print(f"     NFE: {drs_nfe}")
+                print(f"  ⚡ 提案手法 ({condition['name']}):")
+                print(f"     NFE: {drs_nfe} (ベースライン比: {nfe_diff:+d})")
                 print(f"     テキスト: {drs_text[:200]}...")
 
                 print(f"\n📈 品質分析:")
-                print(f"  🔄 NFE削減: {nfe_reduction:.1f}%")
                 print(f"  💎 総合品質スコア: {drs_quality:.3f}")
                 print(
-                    f"  🎭 意味的一貫性: {quality_details['semantic_consistency']:.3f}")
+                    f"     - 意味的一貫性: {quality_details['semantic_consistency']:.3f}")
                 print(
-                    f"  🔁 反復ペナルティスコア: {quality_details['repetition_score']:.3f}")
-                print(f"  📏 長さ比率: {quality_details['length_ratio']:.3f}")
-                print(f"  🎯 最大曖昧度: {max_ambiguity:.3f}")
-                print(f"  📊 曖昧度分散: {ambiguity_variance:.3f}")
-                print(
-                    f"  🔍 意味あるブロック: {meaningful_blocks}/{len(ambiguity_scores)}")
+                    f"     - 反復ペナルティ: {quality_details['repetition_score']:.3f}")
+                print(f"     - 長さ比率: {quality_details['length_ratio']:.3f}")
 
-                # 厳格なDRS価値評価（品質を最優先）
-                # 意味的一貫性が重要
-                semantic_ok = quality_details['semantic_consistency'] >= 0.8
-                # 反復が少ない
-                repetition_ok = quality_details['repetition_score'] >= 0.7
-                efficiency_ok = nfe_reduction >= 10                          # 効率向上
+                # 仮説検証
+                # DRSは、NFEをわずかに増加させることで、品質を大幅に向上させることを目指す
+                quality_improved = drs_quality > evaluator.comprehensive_quality_score(
+                    prompt, baseline_text, baseline_text)[0] * 1.05  # 5%以上の改善
+                nfe_efficient = drs_nfe < total_steps * 1.2  # NFEの増加が20%以内に収まっている
 
-                if semantic_ok and repetition_ok and efficiency_ok:
-                    drs_value = "✅ TRUE - 意味保持&効率向上達成"
-                elif semantic_ok and repetition_ok:
-                    drs_value = "⚠️ PARTIAL - 品質保持だが効率向上限定的"
-                elif efficiency_ok:
-                    drs_value = "❌ FALSE - 効率向上あるが品質劣化"
+                if quality_improved and nfe_efficient:
+                    drs_value = "✅ TRUE - 少ないNFE増加で品質が大幅に向上"
+                elif quality_improved:
+                    drs_value = "⚠️ PARTIAL - 品質は向上したが、NFEが増えすぎた"
+                elif not quality_improved and nfe_efficient:
+                    drs_value = "❌ FALSE - 品質が向上せず、DRSの効果が見られない"
                 else:
-                    drs_value = "❌ FALSE - 品質・効率ともに問題"
+                    drs_value = "❌ FALSE - 品質が向上せず、NFEも増加した"
 
-                print(f"  🎯 DRS価値評価: {drs_value}")
-
-                # より詳細な分析情報
-                if quality_details['semantic_consistency'] < 0.5:
-                    print(f"  ⚠️  警告: 重大な意味的不一致が検出されました")
-                if quality_details['repetition_score'] < 0.5:
-                    print(f"  ⚠️  警告: 過度な反復が検出されました")
+                print(f"  🎯 DRS仮説評価: {drs_value}")
+                print(f"  - 曖昧度スコア: {[f'{s:.3f}' for s in ambiguity_scores]}")
 
                 # 結果保存
                 results.append({
                     'prompt_id': i+1,
                     'condition': condition['name'],
-                    'nfe_reduction': nfe_reduction,
+                    'nfe_diff': nfe_diff,
                     'total_quality': drs_quality,
                     'semantic_consistency': quality_details['semantic_consistency'],
                     'repetition_score': quality_details['repetition_score'],
                     'length_ratio': quality_details['length_ratio'],
-                    'max_ambiguity': max_ambiguity,
-                    'ambiguity_variance': ambiguity_variance,
-                    'meaningful_blocks': meaningful_blocks,
                     'drs_value': drs_value
                 })
 
         # 全体的な結論
         print(f"\n{'='*80}")
-        print("🎯 大幅改善版検証結果サマリー")
+        print("🎯 DRS仮説検証結果サマリー")
         print(f"{'='*80}")
 
         successful_cases = sum(1 for r in results if 'TRUE' in r['drs_value'])
         partial_cases = sum(1 for r in results if 'PARTIAL' in r['drs_value'])
         total_cases = len(results)
 
-        avg_nfe_reduction = np.mean([r['nfe_reduction'] for r in results])
+        avg_nfe_diff = np.mean([r['nfe_diff'] for r in results])
         avg_total_quality = np.mean([r['total_quality'] for r in results])
         avg_semantic_consistency = np.mean(
             [r['semantic_consistency'] for r in results])
@@ -339,7 +316,7 @@ def test_enhanced_drs_validation():
         print(f"📊 統計:")
         print(f"  ✅ 完全成功: {successful_cases}/{total_cases}")
         print(f"  ⚠️ 部分成功: {partial_cases}/{total_cases}")
-        print(f"  📉 平均NFE削減: {avg_nfe_reduction:.1f}%")
+        print(f"  📉 平均NFE差: {avg_nfe_diff:.1f}")
         print(f"  💎 平均総合品質: {avg_total_quality:.3f}")
         print(f"  🎭 平均意味的一貫性: {avg_semantic_consistency:.3f}")
 
@@ -374,8 +351,8 @@ def test_enhanced_drs_validation():
 
 
 if __name__ == "__main__":
-    results = test_enhanced_drs_validation()
+    results = test_drs_validation()
     if results:
-        print(f"\n✅ 大幅改善版検証完了")
+        print(f"\n✅ DRS仮説検証完了")
     else:
         print(f"\n❌ 検証失敗")
