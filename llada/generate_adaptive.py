@@ -249,7 +249,7 @@ def generate_with_adaptive_scheduling(
             if block_metrics['confidence_scores'] is not None:
                 adaptation_start = time.time()
 
-                # スケジューラーによる適応
+                # スケジューラーによる適応（ブロック分のデータを渡す）
                 next_block_size, adapted_threshold, step_metrics = scheduler.step(
                     logits=block_metrics['final_logits'],
                     tokens=x[:, block_start:block_end],
@@ -460,8 +460,8 @@ def _generate_block_adaptive(
         'nfe': nfe,
         'generation_time': time.time() - block_start_time,
         'confidence_scores': confidence_scores,
-        'final_logits': final_logits,
-        'final_mask_index': final_mask_index,
+        'final_logits': block_logits,  # ブロック分のロジットのみ返す
+        'final_mask_index': block_mask_index,  # ブロック分のマスクのみ返す
         'cache_tier': cache_tier
     }
 
