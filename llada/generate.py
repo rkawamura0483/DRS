@@ -348,6 +348,58 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
     return x0, transfer_index
 
 
+def get_transfer_index_with_confidence(logits, temperature, remasking, mask_index, x, num_transfer_tokens):
+    """
+    Modified version of get_transfer_index that also returns confidence scores.
+
+    Returns:
+        (x0, transfer_index, confidence_scores)
+    """
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+    if remasking == 'low_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.squeeze(
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+    elif remasking == 'random':
+        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+    else:
+        raise NotImplementedError(remasking)
+
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    for j in range(confidence.shape[0]):
+        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
+        transfer_index[j, select_index] = True
+
+    return x0, transfer_index, x0_p
+
+
+def _calculate_ambiguity(confidence_scores, threshold):
+    """
+    ブロックの曖昧度を計算する。
+    信頼度がしきい値を下回るトークンの割合として定義する。
+
+    Args:
+        confidence_scores (Tensor): ブロック内のトークンの信頼度スコア。
+        threshold (float): 信頼度のしきい値。
+
+    Returns:
+        float: 曖昧度スコア (0.0 - 1.0)。
+    """
+    # マスクされておらず、有効な信頼度スコアのみを対象とする
+    valid_scores = confidence_scores[confidence_scores != -np.inf]
+    if valid_scores.numel() == 0:
+        return 0.0  # 有効なトークンがない場合、曖昧度はない
+
+    low_confidence_tokens = (valid_scores < threshold).float()
+    ambiguity_score = low_confidence_tokens.mean().item()
+    return ambiguity_score
+
+
 def allocate_refinement_budget(block_ambiguities, total_refinement_budget):
     """
     Allocate refinement budget proportionally to block ambiguity scores.

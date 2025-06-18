@@ -199,7 +199,7 @@ def enhanced_drs_validation():
             baseline_out, baseline_nfe = generate_with_dual_cache(
                 model, input_ids, steps=total_steps, gen_length=gen_length,
                 block_length=block_length, temperature=0., remasking='low_confidence',
-                mask_id=mask_id
+                mask_id=mask_id, threshold=0.9
             )
             baseline_text = tokenizer.batch_decode(
                 baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
