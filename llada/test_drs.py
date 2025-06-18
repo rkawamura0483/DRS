@@ -81,7 +81,7 @@ def test_drs_with_challenging_tasks():
             # DRS: 小さなt_baseで確実に残りブロックを作る
             drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=total_steps, gen_length=gen_length,
-                block_length=block_length, temperature=0., threshold=0.8, t_base=2  # 小さくして残りブロックを確保
+                block_length=block_length, temperature=0., threshold=0.9, t_base=1  # 小さくして残りブロックを確保
             )
 
             # 結果をデコード
@@ -216,8 +216,7 @@ def test_drs_scalability():
             )
 
             # DRS（適応的t_base）
-            t_base = max(4, config['steps'] // (config['gen_length'] //
-                         config['block_length']) // 3)  # 予算の1/3をベースに
+            t_base = 1
             drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=config['steps'], gen_length=config['gen_length'],
                 block_length=config['block_length'], temperature=0., threshold=0.9, t_base=t_base
@@ -291,12 +290,8 @@ def test_drs_ablation_study():
         ablation_configs = [
             # t_baseの影響
             {'t_base': 1, 'threshold': 0.9, 'name': '低初期予算'},
-            {'t_base': 2, 'threshold': 0.9, 'name': '中初期予算'},
-            {'t_base': 4, 'threshold': 0.9, 'name': '高初期予算'},
             # thresholdの影響
             {'t_base': 1, 'threshold': 0.95, 'name': '低閾値'},
-            {'t_base': 2, 'threshold': 0.95, 'name': '高閾値'},
-            {'t_base': 4, 'threshold': 0.95, 'name': '最高閾値'},
         ]
 
         print(f"\n{'='*80}")
@@ -433,9 +428,7 @@ def test_drs_critical_analysis():
 
             # 段階的に厳しくする実験
             test_conditions = [
-                {'t_base': 4, 'threshold': 0.9, 'name': '厳しい条件'},
-                {'t_base': 3, 'threshold': 0.9, 'name': '極限条件'},
-                {'t_base': 2, 'threshold': 0.9, 'name': '最極限条件'},
+                {'t_base': 1, 'threshold': 0.9, 'name': '厳しい条件'},
             ]
 
             for condition in test_conditions:
