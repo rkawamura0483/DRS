@@ -70,6 +70,7 @@ def test_drs_hypothesis_validation():
 
             # 段階的に厳しくする実験設定
             test_conditions = [
+                {'t_base': 4, 'threshold': 0.90, 'name': '論文基準条件'},
                 {'t_base': 4, 'threshold': 0.95, 'name': '中程度条件'},
                 {'t_base': 6, 'threshold': 0.97, 'name': '厳しい条件'},
                 {'t_base': 8, 'threshold': 0.99, 'name': '極限条件'},
