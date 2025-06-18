@@ -756,15 +756,21 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
             output = model(x[:, :current_block_end], use_cache=True)
             past_key_values = output.past_key_values
 
-        # 保守的な曖昧度計算
+        # 🔑 大幅改善: より保守的な曖昧度計算
         if confidence_scores_initial is not None:
             block_confidence = confidence_scores_initial[0]
             valid_scores = block_confidence[block_confidence != -np.inf]
             if len(valid_scores) > 0:
-                # より保守的な曖昧度計算: 高い閾値のみを使用
-                conservative_threshold = min(threshold + 0.1, 0.95)  # より高い閾値
+                # より保守的な曖昧度計算: 非常に高い閾値のみを使用
+                ultra_conservative_threshold = min(
+                    threshold + 0.15, 0.98)  # 極めて高い閾値
                 ambiguity_score = (
-                    valid_scores < conservative_threshold).float().mean().item()
+                    valid_scores < ultra_conservative_threshold).float().mean().item()
+
+                # 追加の品質チェック: 分散が高い場合は曖昧度を上げる
+                confidence_variance = valid_scores.var().item()
+                if confidence_variance > 0.05:  # 分散が高い場合
+                    ambiguity_score = min(1.0, ambiguity_score + 0.1)
             else:
                 ambiguity_score = 0.0
         else:
@@ -777,7 +783,7 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
         print(f"ブロック {num_block}: 残りマスク={remaining_masks}, "
               f"曖昧度スコア={ambiguity_score:.3f}")
 
-    # Phase 2: 保守的な予算再配分
+    # Phase 2: 極めて保守的な予算再配分
     t_used_base = t_base * num_blocks
     t_refine = max(0, steps - t_used_base)
 
@@ -790,20 +796,19 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
         print(f"  → 予算不足。現在の状態で終了")
         return x, nfe, block_confidences
 
-    # より保守的な追加ステップ配分（曖昧度が高いブロックのみ）
-    # 🔑 修正: 精錬対象ブロックの選択をより厳しくし、品質劣化を防ぐ
+    # 🔑 大幅修正: 精錬対象ブロックの選択をさらに厳しくし、品質劣化を防ぐ
     high_ambiguity_blocks = [i for i, score in enumerate(
-        block_confidences) if score > 0.25]  # 閾値を0.15→0.25に引き上げ
+        block_confidences) if score > 0.4]  # 閾値を0.25→0.4に大幅引き上げ
 
     if len(high_ambiguity_blocks) == 0:
-        print("  → 高曖昧度ブロックなし。追加精錬をスキップ")
+        print("  → 高曖昧度ブロックなし。品質保護のため追加精錬をスキップ")
         return x, nfe, block_confidences
 
     additional_steps = allocate_refinement_budget(block_confidences, t_refine)
     print(f"  → 追加ステップ配分: {additional_steps}")
 
-    # Phase 3: 改善版精錬（品質向上優先）
-    print(f"\nPhase 3: 改善版精錬開始")
+    # Phase 3: 大幅改善版精錬（品質向上優先）
+    print(f"\nPhase 3: 大幅改善版精錬開始")
 
     for num_block, steps_to_add in enumerate(additional_steps):
         if steps_to_add == 0 or num_block not in high_ambiguity_blocks:
@@ -812,7 +817,7 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        # 🔑 改善: 完成ブロックでも曖昧度が高い場合は品質向上精錬を実行
+        # ブロックの状態確認
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
 
@@ -821,11 +826,34 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
             print(
                 f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
         else:
-            # 🔑 新機能: 完成ブロックの品質向上精錬
+            # 🔑 大幅改善: 完成ブロックの品質向上精錬（より慎重に）
             print(
-                f"  → ブロック {num_block} の品質向上精錬を実行（曖昧度: {block_confidences[num_block]:.3f}）")
+                f"  → ブロック {num_block} の品質向上精錬を検討（曖昧度: {block_confidences[num_block]:.3f}）")
 
-            # 低信頼度トークンを特定して再マスク
+            # 現在の品質を詳細評価
+            current_text = x[:, current_block_start:current_block_end]
+
+            # 🔑 新しい安全チェック: ブロック内容の基本品質評価
+            if hasattr(model, 'tokenizer'):
+                decoded_block = model.tokenizer.decode(
+                    current_text[0], skip_special_tokens=True)
+
+                # 基本的な品質チェック
+                has_repetition = len(set(decoded_block.split())) < len(
+                    decoded_block.split()) * 0.7
+                is_too_short = len(decoded_block.strip()) < 10
+                has_obvious_errors = any(error in decoded_block.lower() for error in [
+                                         'unk', '[mask]', '##'])
+
+                if has_repetition or is_too_short or has_obvious_errors:
+                    print(f"    → ブロック {num_block} に品質問題を検出、精錬を実行")
+                else:
+                    # 🔑 重要: 高品質ブロックは保護
+                    if block_confidences[num_block] < 0.6:  # 曖昧度が高くない場合
+                        print(f"    → ブロック {num_block} は十分高品質のため精錬をスキップ")
+                        continue
+
+            # より厳格な再マスク処理
             output = model(x, use_cache=True)
             block_logits = output.logits[:,
                                          current_block_start:current_block_end]
@@ -834,31 +862,39 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
             current_confidence = torch.gather(
                 p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
 
-            # 動的な再マスク閾値（さらに保守的に改善）
-            # 🔑 修正: 過度な再マスクを防ぐため、より厳しい閾値を設定
-            # より慎重な再マスク（0.5→0.8に上昇）
-            remask_threshold = max(threshold * 0.9, 0.8)
+            # 🔑 大幅修正: 極めて保守的な再マスク閾値
+            # 品質劣化を防ぐため、極めて厳しい閾値を設定
+            remask_threshold = max(threshold + 0.2, 0.95)  # 0.8→0.95に大幅引き上げ
             low_conf_mask = current_confidence < remask_threshold
+
+            # 🔑 追加の安全チェック: 再マスク数の制限
+            max_remask_ratio = 0.2  # 最大20%までしか再マスクしない
+            max_remask_count = int(block_length * max_remask_ratio)
+
+            if low_conf_mask.sum().item() > max_remask_count:
+                # 最も信頼度の低いトークンのみを選択
+                confidence_values = current_confidence[0]
+                _, lowest_indices = torch.topk(
+                    confidence_values, max_remask_count, largest=False)
+                new_low_conf_mask = torch.zeros_like(low_conf_mask)
+                new_low_conf_mask[0, lowest_indices] = True
+                low_conf_mask = new_low_conf_mask
 
             if low_conf_mask.sum().item() > 0:
                 # 低信頼度トークンを再マスク
                 x[:, current_block_start:current_block_end][low_conf_mask] = mask_id
-                print(f"    → {low_conf_mask.sum().item()}個の低信頼度トークンを再マスク")
+                print(f"    → {low_conf_mask.sum().item()}個の低信頼度トークンを慎重に再マスク")
 
                 # 新しいマスクインデックスを設定
                 block_mask_index = (
                     x[:, current_block_start:current_block_end] == mask_id)
                 nfe += 1
             else:
-                print(f"    → ブロック {num_block} は十分高品質のためスキップ")
+                print(f"    → ブロック {num_block} は極めて高品質のためスキップ")
                 continue
 
-        # 共通精錬処理
+        # 共通精錬処理（既存のコードと同じ）
         if block_mask_index.sum().item() > 0:
-            # 既存マスクがある場合の通常精錬
-            print(
-                f"  → ブロック {num_block} の既存マスク {block_mask_index.sum().item()}個を精錬")
-
             # KVキャッシュ準備
             output = model(x, use_cache=True)
             past_key_values_refine = output.past_key_values
@@ -904,7 +940,7 @@ def generate_with_conservative_drs(model, prompt, steps=128, gen_length=128, blo
 
                 x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
         else:
-            print(f"  → ブロック {num_block} は完成済み。品質保護のため精錬スキップ")
+            print(f"  → ブロック {num_block} は高品質のため精錬をスキップ")
 
     # 最終結果
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
