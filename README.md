@@ -45,48 +45,40 @@ While token selection is dynamic, computational effort remains fixed—every blo
 
 ## Proposed Method: Dynamic Refinement Scheduling
 
-DRS replaces a fixed-step schedule with an adaptive, two-phase approach integrated with the Fast-dLLM block-wise cache.
+DRS was designed to replace a fixed-step schedule with an adaptive, two-phase approach integrated with the Fast-dLLM block-wise cache.
 
 ### Phase 1: Coarse Initial Pass
-A base number of denoising steps (`T_base`, e.g., 8) are performed sequentially for each block. This quickly establishes a draft generation. During this phase, the model's confidence in each generated token is collected with minimal overhead.
+A base number of denoising steps (`T_base`, e.g., 8) were performed sequentially for each block. This quickly establishes a draft generation. During this phase, the model's confidence in each generated token was collected.
 
 ### Phase 2: Difficulty Assessment & Adaptive Refinement
-After the initial pass, an "ambiguity score" is calculated for each block based on the collected confidences:
+After the initial pass, an "ambiguity score" was calculated for each block based on the collected confidences:
 ```
 Ambiguity(Block_i) = Fraction of tokens j where Confidence(token_j) < τ
 ```
-The remaining computational budget (`T_refine = T_total - T_used_in_pass_1`) is then distributed among the blocks. The number of additional refinement steps allocated to each block is proportional to its ambiguity score. Blocks with low ambiguity may receive zero additional steps, saving computation, while challenging blocks are refined further. This refinement phase re-masks low-confidence tokens within the high-ambiguity blocks and regenerates them.
+The remaining computational budget (`T_refine = T_total - T_used_in_pass_1`) was then intended to be distributed among the blocks proportionally to their ambiguity scores. The goal was for challenging blocks to receive more refinement steps, while computation was saved on simpler blocks.
 
-## Novelty and Contribution
-
-**Technical Novelty**: First method to repurpose confidence signals for dynamic, block-level computational scheduling in diffusion LLMs.
-
-**Practical Impact**: A training-free algorithmic enhancement that improves the efficiency-accuracy trade-off in state-of-the-art diffusion models.
-
-**Theoretical Significance**: Establishes a new speed-accuracy frontier by allocating computation based on generation difficulty.
-
-## Evaluation and Preliminary Results
+## Experimental Validation and Analysis
 
 ### Evaluation Framework
-To validate the effectiveness of DRS, a test harness (`llada/test_drs.py`) was created to compare DRS against the Fast-dLLM baseline. The framework evaluates performance on a set of diverse tasks (math, code, explanation) using a composite quality score that measures coherence, completeness, and accuracy.
+To validate the effectiveness of DRS, a test harness (`llada/test_drs.py`) was created to compare DRS against the Fast-dLLM baseline (`generate_with_dual_cache`). The framework evaluated performance on a small, diverse set of tasks (math, code, explanation). It measured the Number of Function Evaluations (NFE) for efficiency and used a custom composite score for quality. The experiment also included a `DRS-Uniform-Control` variant that allocated the refinement budget equally among ambiguous blocks, serving as a control against the core proportional allocation hypothesis.
 
-The core of the evaluation is a trade-off rating system that classifies the performance of DRS based on two axes:
-1.  **Quality Gain**: The change in the quality score compared to the baseline.
-2.  **Efficiency Gain**: The ratio of Number of Function Evaluations (NFE) used by DRS versus the baseline.
+### Key Findings and Critical Flaws
+The experimental results did not validate the DRS hypothesis. Analysis of the run logs revealed that DRS, in its current implementation, is outperformed by the baseline, with an average **1.3x increase in NFE** and a slight **decrease in quality**. The investigation pinpointed three fundamental flaws:
 
-### Preliminary Findings
-Initial results are highly promising and provide strong support for the DRS hypothesis.
-- **Efficiency**: Across various configurations, DRS consistently and significantly reduced the required computation, achieving an average NFE of approximately **50%** that of the baseline Fast-dLLM.
-- **Quality**: This efficiency gain came at a negligible cost to generation quality, which remained on par with the baseline.
-- **Configuration Analysis**: The "Aggressive" DRS configuration (with a low `T_base`) demonstrated the best performance, maximizing NFE reduction while slightly improving the quality score.
+1.  **Conceptual Flaw in Efficiency**: The baseline method is adaptive and can finish tasks in very few steps. The DRS implementation forces a minimum number of steps (`T_base`) in its first phase. On simple tasks, this initial cost was already higher than the baseline's *total* computational cost, making it impossible for DRS to be more efficient.
 
-These findings suggest that DRS is effective at identifying and focusing on "hard" parts of a sequence, successfully converting saved computation from "easy" parts into better performance where it matters most.
+2.  **Mechanism Flaw in Allocation**: The core novelty of DRS—allocating refinement budget proportionally to block ambiguity—showed **no benefit over the simple uniform allocation control**. In all test cases, the `DRS-Balanced` and `DRS-Uniform-Control` configurations produced identical outputs and performance, suggesting the complex allocation strategy was ineffective.
 
-## Limitations and Future Work
-The current validation provides a strong proof of concept but has limitations that form the basis for future work:
+3.  **Evaluation Flaw in Quality Metrics**: The custom quality evaluator proved unreliable. In one case, it assigned an "EXCELLENT" rating to a grammatically incorrect and repetitive output that was clearly inferior to the baseline. This flaw makes it impossible to trust any of the reported quality gains and casts doubt on the validity of the entire test harness.
 
-1.  **Standardized Benchmarking**: The current results are from a small, custom test suite. The next critical step is to evaluate DRS on established benchmarks like **GSM8K, MATH, and HumanEval** to rigorously measure its impact on complex reasoning and code generation tasks.
-2.  **Evaluate Improved DRS**: An enhanced version of the algorithm exists in `llada/generate_drs_v2.py`, featuring more advanced mechanisms like dynamic thresholds and context-aware refinement. This version has not yet been evaluated but holds the potential for even greater gains.
-3.  **Ablation Studies**: Systematic ablation studies, as originally planned, are needed to fully understand the sensitivity to `T_base`, the choice of ambiguity metric, and the budget allocation strategy.
+## Conclusion: A Clear Null Result
+The experiment conclusively shows that the tested DRS implementation is not a viable improvement over the Fast-dLLM baseline. The combination of its inefficiency on simple tasks and the ineffectiveness of its core mechanism means the hypothesis is not supported.
 
-Success in these future steps would firmly establish DRS as a valuable technique for making diffusion LLMs more competitive with autoregressive models in production scenarios.
+## Lessons Learned and Future Directions
+While the result was negative, the experiment provides critical insights that inform future research in this area. The path forward is not to refine the current DRS, but to learn from its failures.
+
+1.  **Priority 1: Build a Robust Evaluation Harness**: Before any new method is tested, a reliable evaluation framework is non-negotiable. The next step must be to integrate established benchmarks like **GSM8K, MATH, and HumanEval** to ensure results are meaningful and comparable.
+
+2.  **Rethink the Adaptive Strategy**: A successful adaptive method must be able to "finish early" and be more efficient than the baseline on *all* task difficulties. The more sophisticated ideas in `llada/generate_drs_v2.py` (e.g., prioritizing incomplete blocks) may offer a better starting point, but they must be rigorously tested against the strong baseline.
+
+3.  **Embrace the Null Result**: This work serves as a valuable case study on the potential pitfalls of designing adaptive computation schemes for dLLMs. It highlights that a seemingly intuitive approach may fail due to incorrect assumptions about the baseline's behavior and the difficulty of creating reliable evaluation metrics. Success in future work will depend on addressing these foundational challenges.
