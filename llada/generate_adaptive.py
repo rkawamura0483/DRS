@@ -427,18 +427,24 @@ def _generate_block_adaptive(
     # 信頼度フィルタリング
     if confidence_probs is not None:
         confidence_mask = confidence_probs >= current_threshold
-        final_transfer_index = transfer_index & confidence_mask.unsqueeze(0)
+        final_transfer_index = transfer_index & confidence_mask
     else:
         final_transfer_index = transfer_index
 
     # ブロック範囲でのトークン更新
     block_x0 = x0  # ブロック分のトークン
-    x[:, block_start:block_end][final_transfer_index] = block_x0[final_transfer_index]
+    # final_transfer_indexを使ってブロック内のトークンを更新
+    if final_transfer_index.any():
+        x[:, block_start:block_end][final_transfer_index] = block_x0[final_transfer_index]
 
     # 信頼度スコアの計算
     if confidence_probs is not None:
         # confidence_probsはすでにブロック範囲なので、そのまま使用
-        confidence_scores = confidence_probs[block_mask_index[0]]
+        # block_mask_indexが2次元なので、マスクされた部分のみ抽出
+        if block_mask_index.any():
+            confidence_scores = confidence_probs[block_mask_index]
+        else:
+            confidence_scores = torch.tensor([])
 
     # キャッシュ更新
     if cache_manager is not None and confidence_scores is not None:
