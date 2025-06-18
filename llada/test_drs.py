@@ -1,8 +1,8 @@
-import torch
 import numpy as np
-from transformers import AutoTokenizer
-from model.modeling_llada import LLaDAModelLM
+import torch
 from generate import generate, generate_with_drs_fixed
+from model.modeling_llada import LLaDAModelLM
+from transformers import AutoTokenizer
 
 
 def test_drs_with_challenging_tasks():
@@ -172,7 +172,7 @@ def test_drs_scalability():
     test_configs = [
         {'gen_length': 128, 'block_length': 32, 'steps': 96, 'name': '短文生成'},
         {'gen_length': 256, 'block_length': 32, 'steps': 128, 'name': '中文生成'},
-        {'gen_length': 384, 'block_length': 48, 'steps': 192, 'name': '長文生成'},
+        {'gen_length': 1024, 'block_length': 32, 'steps': 192, 'name': '長文生成'},
     ]
 
     # 中程度の複雑さのプロンプト
@@ -290,13 +290,13 @@ def test_drs_ablation_study():
         # アブレーション研究の設定
         ablation_configs = [
             # t_baseの影響
-            {'t_base': 4, 'threshold': 0.8, 'name': '低初期予算'},
-            {'t_base': 8, 'threshold': 0.8, 'name': '中初期予算'},
-            {'t_base': 12, 'threshold': 0.8, 'name': '高初期予算'},
+            {'t_base': 1, 'threshold': 0.9, 'name': '低初期予算'},
+            {'t_base': 2, 'threshold': 0.9, 'name': '中初期予算'},
+            {'t_base': 4, 'threshold': 0.9, 'name': '高初期予算'},
             # thresholdの影響
-            {'t_base': 6, 'threshold': 0.6, 'name': '低閾値'},
-            {'t_base': 6, 'threshold': 0.8, 'name': '高閾値'},
-            {'t_base': 6, 'threshold': 0.9, 'name': '最高閾値'},
+            {'t_base': 1, 'threshold': 0.95, 'name': '低閾値'},
+            {'t_base': 2, 'threshold': 0.95, 'name': '高閾値'},
+            {'t_base': 4, 'threshold': 0.95, 'name': '最高閾値'},
         ]
 
         print(f"\n{'='*80}")
