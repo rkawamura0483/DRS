@@ -464,8 +464,10 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
             confidence_history.append(step_confidence.clone())
 
         # 残りのステップ: ブロック単位での処理
-        replace_position = torch.zeros_like(x, dtype=torch.bool)
-        replace_position[:, current_block_start:current_block_end] = 1
+        # 🔑 修正: replace_positionをブロック用に調整
+        replace_position = torch.zeros(
+            (1, block_length), dtype=torch.bool, device=x.device)
+        replace_position[:, :] = 1  # ブロック全体が対象
 
         for i in range(1, t_base):
             nfe += 1
@@ -615,8 +617,10 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
             past_key_values_refine = new_past_key_values
 
             # リファインメントループ
-            replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
-            replace_pos_refine[:, current_block_start:current_block_end] = 1
+            # 🔑 修正: replace_positionをブロック用に調整
+            replace_pos_refine = torch.zeros(
+                (1, block_length), dtype=torch.bool, device=x.device)
+            replace_pos_refine[:, :] = 1  # ブロック全体が対象
 
             for i in range(steps_to_add):
                 if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:

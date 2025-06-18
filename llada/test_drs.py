@@ -173,21 +173,24 @@ def test_drs_hypothesis_validation():
                     f"    曖昧なブロック数: {num_nonzero_ambiguity}/{len(ambiguity_scores)}")
                 print(f"  曖昧度分布: {[f'{s:.3f}' for s in ambiguity_scores]}")
 
-                # DRS価値の評価
+                # DRS価値の評価（品質を考慮）
                 early_termination_rate = (1 - drs_nfe/total_steps) * 100
 
-                if has_ambiguous_blocks and ambiguity_variance > 0.005:
-                    if early_termination_rate < 70:  # 適度な早期終了
+                if has_ambiguous_blocks and ambiguity_variance > 0.005 and repetition_score > 0.7:
+                    if early_termination_rate < 70 and quality_preservation > 50:  # 適度な早期終了＋品質保持
                         drs_value = "TRUE - 動的配分が有効"
                         value_symbol = "✅"
-                    else:
-                        drs_value = "PARTIAL - 動的配分有効だが早期終了過多"
+                    elif quality_preservation > 30:
+                        drs_value = "PARTIAL - 動的配分有効だが品質要改善"
                         value_symbol = "⚠️"
-                elif nfe_reduction > 20 and early_termination_rate < 80:
+                    else:
+                        drs_value = "FALSE - 品質劣化過多"
+                        value_symbol = "❌"
+                elif nfe_reduction > 20 and quality_preservation > 40 and repetition_score > 0.6:
                     drs_value = "PARTIAL - 早期終了効果のみ"
                     value_symbol = "⚠️"
                 else:
-                    drs_value = "FALSE - 効果なし"
+                    drs_value = "FALSE - 効果なしまたは品質劣化"
                     value_symbol = "❌"
 
                 print(f"  {value_symbol} DRS価値: {drs_value}")
@@ -204,8 +207,11 @@ def test_drs_hypothesis_validation():
                     'num_ambiguous_blocks': num_nonzero_ambiguity,
                     'nfe_reduction': nfe_reduction,
                     'quality_preservation': quality_preservation,
+                    'repetition_score': repetition_score,
                     'early_termination_rate': early_termination_rate,
-                    'drs_value': drs_value
+                    'drs_value': drs_value,
+                    'baseline_words': baseline_words,
+                    'drs_words': drs_words
                 })
 
         # 全体的な研究結論
