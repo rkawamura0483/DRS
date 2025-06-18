@@ -494,10 +494,110 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
     # Phase 3: 標的精錬（改善版）
     if any(steps > 0 for steps in additional_steps):
         print(f"\nPhase 3: 改善版標的精錬開始")
-        print(f"  精錬理由: 曖昧度に基づく品質向上")
 
-        # この段階でさらに精錬を実行（実装は既存のロジックを使用）
-        # 実際の精錬処理は元のコードと同様
+        if total_remaining_masks > 0:
+            print(f"  精錬理由: 残存マスクを持つブロックの品質向上")
+            # 従来の未完成ブロック精錬
+            for num_block, steps_to_add in enumerate(additional_steps):
+                if steps_to_add == 0:
+                    continue
+
+                current_block_start = prompt.shape[1] + \
+                    num_block * block_length
+                current_block_end = current_block_start + block_length
+
+                # このブロックに精錬すべきマスクが残っているか確認
+                if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
+                    continue
+
+                block_mask_index = (
+                    x[:, current_block_start:current_block_end] == mask_id)
+                num_transfer_tokens_refine = get_num_transfer_tokens(
+                    block_mask_index, steps_to_add)
+
+                print(
+                    f"  → ブロック {num_block} を {steps_to_add} ステップで精錬...")
+
+                for i in range(steps_to_add):
+                    # このブロックが精錬中に完成したらループを抜ける
+                    if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
+                        print(f"    ブロック {num_block} の精錬完了 (早期終了)")
+                        break
+
+                    nfe += 1
+                    mask_index = (x == mask_id)
+                    logits = model(x).logits
+                    mask_index[:, current_block_end:] = 0
+
+                    # 精錬ステップでは、現在のブロック内のマスクのみを対象にする
+                    refine_mask_index = (
+                        x[:, current_block_start:current_block_end] == mask_id)
+
+                    x0, transfer_index, _ = get_transfer_index_with_confidence(
+                        logits, temperature, remasking, mask_index, x, num_transfer_tokens_refine[:, i])
+
+                    # transfer_index が現在のブロックの外に影響しないようにする
+                    final_transfer_index = torch.zeros_like(
+                        x, dtype=torch.bool, device=x.device)
+                    final_transfer_index[:,
+                                         current_block_start:current_block_end] = transfer_index[:, current_block_start:current_block_end]
+
+                    x[final_transfer_index] = x0[final_transfer_index]
+        else:
+            print(f"  精錬理由: 完成ブロックの信頼度ベース品質向上")
+            # 🔑 新機能: 完成ブロックの信頼度ベース精錬
+            for num_block, steps_to_add in enumerate(additional_steps):
+                if steps_to_add == 0:
+                    continue
+
+                current_block_start = prompt.shape[1] + \
+                    num_block * block_length
+                current_block_end = current_block_start + block_length
+
+                print(
+                    f"  → ブロック {num_block} を信頼度ベースで {steps_to_add} ステップ精錬...")
+
+                for i in range(steps_to_add):
+                    nfe += 1
+
+                    # 現在のブロックのみをモデルに入力して推論
+                    logits = model(x).logits
+
+                    # ブロック内の各トークンの信頼度を計算
+                    block_logits = logits[0,
+                                          current_block_start:current_block_end]
+                    p = F.softmax(block_logits.to(torch.float64), dim=-1)
+                    current_tokens = x[0,
+                                       current_block_start:current_block_end]
+                    current_confidence = torch.gather(
+                        p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
+
+                    # 最も信頼度の低いトークンを特定
+                    min_confidence_idx = torch.argmin(current_confidence)
+                    min_confidence_value = current_confidence[min_confidence_idx].item(
+                    )
+
+                    # 信頼度が閾値未満なら、そのトークンを改善
+                    if min_confidence_value < threshold:
+                        # より良い候補を生成
+                        new_logits_with_noise = add_gumbel_noise(
+                            block_logits, temperature=temperature)
+                        new_token = torch.argmax(
+                            new_logits_with_noise[min_confidence_idx])
+
+                        old_token = x[0, current_block_start +
+                                      min_confidence_idx].item()
+                        x[0, current_block_start + min_confidence_idx] = new_token
+
+                        print(
+                            f"    位置 {min_confidence_idx}: token {old_token} → {new_token.item()} (信頼度: {min_confidence_value:.3f})")
+                    else:
+                        print(
+                            f"    ブロック {num_block} の品質は十分 (最低信頼度: {min_confidence_value:.3f})")
+                        break
+
+    elif any(steps > 0 for steps in additional_steps):
+        print(f"\nPhase 3: スキップ - 追加精錬予算が不適切")
 
     # 最終結果
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()

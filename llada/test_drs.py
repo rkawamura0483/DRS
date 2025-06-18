@@ -69,11 +69,11 @@ def test_drs_hypothesis_validation():
             input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
             # 段階的に厳しくする実験設定
+            # t_baseを小さくして、意図的にPhase1で未完成ブロックを発生させる
             test_conditions = [
-                {'t_base': 4, 'threshold': 0.90, 'name': '論文基準条件'},
-                {'t_base': 4, 'threshold': 0.95, 'name': '中程度条件'},
-                {'t_base': 6, 'threshold': 0.97, 'name': '厳しい条件'},
-                {'t_base': 8, 'threshold': 0.99, 'name': '極限条件'},
+                {'t_base': 2, 'threshold': 0.90, 'name': '挑戦的条件 (t_base=2)'},
+                {'t_base': 4, 'threshold': 0.95, 'name': '中程度条件 (t_base=4)'},
+                {'t_base': 6, 'threshold': 0.97, 'name': '厳しい条件 (t_base=6)'},
             ]
 
             for condition in test_conditions:
@@ -109,6 +109,16 @@ def test_drs_hypothesis_validation():
                     baseline_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
                 drs_text = tokenizer.batch_decode(
                     drs_out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
+
+                # === 品質を直接比較するための出力を追加 ===
+                print("\n--- 生成結果比較 ---")
+                print(f"--- [Baseline] NFE: {baseline_nfe} ---")
+                print(baseline_text)
+                print(
+                    f"--- [DRS] NFE: {drs_nfe}, 曖昧度分散: {np.var(ambiguity_scores):.3f} ---")
+                print(drs_text)
+                print("--- 比較終了 ---\n")
+                # =======================================
 
                 nfe_reduction = ((baseline_nfe - drs_nfe) / baseline_nfe) * 100
                 quality_preservation = len(
