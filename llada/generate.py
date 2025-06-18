@@ -186,7 +186,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
 @torch.no_grad()
 def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                             remasking='low_confidence', mask_id=126336, threshold=None):
+                             remasking='low_confidence', mask_id=None, threshold=None):
     '''
     Args:
         model: Mask predictor.
@@ -197,8 +197,15 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         temperature: Categorical distribution sampling temperature.
         cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
+        mask_id: The toke id of [MASK]. If None, will be obtained from model config.
     '''
+    # mask_idを適切に取得
+    if mask_id is None:
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'mask_token_id') and model.tokenizer.mask_token_id is not None:
+            mask_id = model.tokenizer.mask_token_id
+        else:
+            mask_id = model.config.mask_token_id
+
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -209,24 +216,13 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
     assert steps % num_blocks == 0
     steps = steps // num_blocks
 
-    print(f"🔍 DEBUG: generate_with_dual_cache started")
-    print(f"  Total blocks: {num_blocks}, Steps per block: {steps}")
-    print(f"  Initial total masks: {(x == mask_id).sum().item()}")
-    print(f"  Generation length: {gen_length}, Block length: {block_length}")
-
     nfe = 0
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        print(
-            f"\n📦 Block {num_block}/{num_blocks-1} (pos {current_block_start}-{current_block_end-1})")
-
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
-        initial_block_masks = block_mask_index.sum().item()
-        print(f"  Initial block masks: {initial_block_masks}/{block_length}")
-
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
         # cache init and update
@@ -234,31 +230,10 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         past_key_values = output.past_key_values
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
-
-        # デバッグ: 信頼度情報を取得
-        if remasking == 'low_confidence':
-            p = F.softmax(output.logits.to(torch.float64), dim=-1)
-            logits_with_noise = add_gumbel_noise(
-                output.logits, temperature=temperature)
-            x0_pred = torch.argmax(logits_with_noise, dim=-1)
-            x0_p = torch.squeeze(torch.gather(
-                p, dim=-1, index=torch.unsqueeze(x0_pred, -1)), -1)
-            block_confidences = x0_p[:,
-                                     current_block_start:current_block_end][block_mask_index]
-            print(
-                f"  Step 0: Block confidences (masked tokens): {block_confidences.mean().item():.3f} ± {block_confidences.std().item():.3f}")
-
         x0, transfer_index = get_transfer_index(
             output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
         x[transfer_index] = x0[transfer_index]
         nfe += 1
-
-        # 第1ステップ後の状況をデバッグ
-        total_masks_after_step0 = (x == mask_id).sum().item()
-        block_masks_after_step0 = (
-            x[:, current_block_start:current_block_end] == mask_id).sum().item()
-        print(
-            f"  Step 0 completed: NFE={nfe}, Block masks: {block_masks_after_step0}/{block_length}, Total masks: {total_masks_after_step0}")
 
         i = 1
         replace_position = torch.zeros_like(x, dtype=torch.bool)
@@ -267,55 +242,17 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
             nfe += 1
             mask_index = (
                 x[:, current_block_start:current_block_end] == mask_id)
-            current_block_masks = mask_index.sum().item()
-            current_total_masks = (x == mask_id).sum().item()
-
-            print(
-                f"  Step {i}: Block masks before processing: {current_block_masks}/{block_length}, Total masks: {current_total_masks}")
-
             # cache position is the position between current_block_start and current_block_end
             logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
                            use_cache=True, replace_position=replace_position).logits
 
-            # デバッグ: 信頼度情報を取得
-            if remasking == 'low_confidence' and mask_index.sum() > 0:
-                p = F.softmax(logits.to(torch.float64), dim=-1)
-                logits_with_noise = add_gumbel_noise(
-                    logits, temperature=temperature)
-                x0_pred = torch.argmax(logits_with_noise, dim=-1)
-                x0_p = torch.squeeze(torch.gather(
-                    p, dim=-1, index=torch.unsqueeze(x0_pred, -1)), -1)
-                block_confidences = x0_p[mask_index]
-                print(
-                    f"    Confidences (masked tokens): {block_confidences.mean().item():.3f} ± {block_confidences.std().item():.3f}")
-
             x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
                                                     x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-
-            # ステップ完了後の状況をデバッグ
-            block_masks_after = (
-                x[:, current_block_start:current_block_end] == mask_id).sum().item()
-            total_masks_after = (x == mask_id).sum().item()
-            tokens_unmasked_this_step = current_block_masks - block_masks_after
-            print(
-                f"    After processing: Block masks: {block_masks_after}/{block_length} (-{tokens_unmasked_this_step}), Total masks: {total_masks_after}, NFE={nfe}")
-
             if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                print(
-                    f"    ✅ Block {num_block} completed in {i+1} steps (including step 0)")
                 break
             i += 1
 
-            # 無限ループ防止
-            if i >= steps:
-                print(
-                    f"    ⚠️ Block {num_block} reached max steps ({steps}) with {block_masks_after} masks remaining")
-                break
-
-    final_total_masks = (x == mask_id).sum().item()
-    print(f"\n🎯 DEBUG: generate_with_dual_cache completed")
-    print(f"  Final NFE: {nfe}, Final total masks: {final_total_masks}")
     return x, nfe
 
 
