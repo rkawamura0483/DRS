@@ -435,47 +435,57 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
     # ======== フェーズ1: 初期生成 ========
     print(f"Phase 1: 初期生成 (t_base={t_base} per block)")
 
-    past_key_values = None
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
-        # KVキャッシュの準備 (デュアルキャッシュ戦略に類似)
-        output = model(x[:, :current_block_end] if num_block == 0 else x[:,
-                       current_block_start:current_block_end], past_key_values=past_key_values, use_cache=True)
-        if num_block == 0:
-            past_key_values = output.past_key_values
-
+        # generate_with_dual_cache を参考にした、効率的なKVキャッシュ戦略
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
         nfe += 1
 
-        block_conf_scores = None
-        for i in range(t_base):
+        # 最初のステップ: 全体シーケンスからlogitsを取得し、マスクを更新
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0  # 現在のブロック以降はマスクしない
+        num_initial_transfer = get_num_transfer_tokens(mask_index, t_base)[
+            :, 0]
+        x0, transfer_index, _ = get_transfer_index_with_confidence(
+            output.logits, temperature, remasking, mask_index, x, num_initial_transfer
+        )
+        x[transfer_index] = x0[transfer_index]
+
+        # KVキャッシュをプレフィックス部分のみに刈り込む
+        trimmed_past_key_values = []
+        for i in range(len(past_key_values)):
+            trimmed_past_key_values.append(())
+            for j in range(len(past_key_values[i])):
+                trimmed_past_key_values[i] += (past_key_values[i]
+                                               [j][:, :, :current_block_start],)
+
+        # 残りの t_base-1 ステップを現在のブロックで実行
+        for i in range(1, t_base):
             mask_index_block = (
                 x[:, current_block_start:current_block_end] == mask_id)
             if mask_index_block.sum() == 0:
                 print(f"  ブロック {num_block}: {i} ステップで早期完了")
                 break
 
-            # モデル呼び出しからlogitsを取得 (最初のステップでは既に取得済み)
-            if i > 0:
-                replace_position = torch.zeros(
-                    (1, block_length), dtype=torch.bool, device=x.device)
-                replace_position[:, :] = 1
-                output = model(x[:, current_block_start:current_block_end],
-                               past_key_values=past_key_values, use_cache=True, replace_position=replace_position)
-                nfe += 1
+            replace_position = torch.zeros(
+                (1, block_length), dtype=torch.bool, device=x.device)
+            replace_position[:, :] = 1  # ブロック全体を対象
 
-            logits = output.logits
+            logits = model(x[:, current_block_start:current_block_end], past_key_values=trimmed_past_key_values,
+                           use_cache=True, replace_position=replace_position).logits
+            nfe += 1
 
             num_transfer_tokens = get_num_transfer_tokens(
-                mask_index_block, t_base - i)
-            x0_block, transfer_index_block, conf_scores_block = get_transfer_index_with_confidence(
+                mask_index_block, t_base - i)[:, 0]
+            x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
                 logits, temperature, remasking, mask_index_block,
-                x[:, current_block_start:current_block_end], num_transfer_tokens[:, 0]
+                x[:, current_block_start:current_block_end], num_transfer_tokens
             )
 
             x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
-            block_conf_scores = conf_scores_block[0]
 
         # 最終的なブロックの信頼度を計算・保存
         final_logits = model(
