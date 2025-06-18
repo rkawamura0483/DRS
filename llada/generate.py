@@ -455,13 +455,13 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
 
         for i in range(t_base):
             nfe += 1
-            # 効率的な推論：現在のブロックのみをモデルに渡す
-            replace_position = torch.zeros_like(
-                x, dtype=torch.bool, device=x.device)
-            replace_position[:, current_block_start:current_block_end] = True
+            # 🔑 修正: replace_positionの正しい設定（generate_with_dual_cacheに従う）
+            replace_position = torch.zeros_like(x, dtype=torch.bool)
+            replace_position[:, current_block_start:current_block_end] = 1
 
+            # モデル入力：ブロックのみ、KVキャッシュとreplace_positionを使用
             logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                           use_cache=False, replace_position=replace_position).logits
+                           use_cache=True, replace_position=replace_position).logits
 
             mask_index_block = (
                 x[:, current_block_start:current_block_end] == mask_id)
@@ -559,13 +559,12 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                 # 最新のKVキャッシュを取得
                 output = model(x[:, :current_block_start], use_cache=True)
                 past_key_values_refine = output.past_key_values
-                replace_pos_refine = torch.zeros_like(
-                    x, dtype=torch.bool, device=x.device)
+                replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
                 replace_pos_refine[:,
-                                   current_block_start:current_block_end] = True
+                                   current_block_start:current_block_end] = 1
 
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
-                               use_cache=False, replace_position=replace_pos_refine).logits
+                               use_cache=True, replace_position=replace_pos_refine).logits
                 nfe += 1
 
                 p = F.softmax(logits.to(torch.float64), dim=-1)
@@ -607,13 +606,12 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                     break
 
                 nfe += 1
-                replace_pos_refine = torch.zeros_like(
-                    x, dtype=torch.bool, device=x.device)
+                replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
                 replace_pos_refine[:,
-                                   current_block_start:current_block_end] = True
+                                   current_block_start:current_block_end] = 1
 
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
-                               use_cache=False, replace_position=replace_pos_refine).logits
+                               use_cache=True, replace_position=replace_pos_refine).logits
 
                 refine_mask_index = (
                     x[:, current_block_start:current_block_end] == mask_id)
