@@ -81,7 +81,7 @@ def test_drs_with_challenging_tasks():
             # DRS: 小さなt_baseで確実に残りブロックを作る
             drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=total_steps, gen_length=gen_length,
-                block_length=block_length, temperature=0., threshold=0.8, t_base=6  # 小さくして残りブロックを確保
+                block_length=block_length, temperature=0., threshold=0.8, t_base=2  # 小さくして残りブロックを確保
             )
 
             # 結果をデコード
@@ -220,7 +220,7 @@ def test_drs_scalability():
                          config['block_length']) // 3)  # 予算の1/3をベースに
             drs_out, drs_nfe, ambiguity_scores = generate_with_drs_fixed(
                 model, input_ids, steps=config['steps'], gen_length=config['gen_length'],
-                block_length=config['block_length'], temperature=0., threshold=0.75, t_base=t_base
+                block_length=config['block_length'], temperature=0., threshold=0.9, t_base=t_base
             )
 
             # 効果測定
@@ -433,9 +433,9 @@ def test_drs_critical_analysis():
 
             # 段階的に厳しくする実験
             test_conditions = [
-                {'t_base': 4, 'threshold': 0.7, 'name': '厳しい条件'},
-                {'t_base': 3, 'threshold': 0.6, 'name': '極限条件'},
-                {'t_base': 2, 'threshold': 0.5, 'name': '最極限条件'},
+                {'t_base': 4, 'threshold': 0.9, 'name': '厳しい条件'},
+                {'t_base': 3, 'threshold': 0.9, 'name': '極限条件'},
+                {'t_base': 2, 'threshold': 0.9, 'name': '最極限条件'},
             ]
 
             for condition in test_conditions:
