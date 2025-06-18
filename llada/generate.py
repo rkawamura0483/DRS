@@ -434,10 +434,6 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
     nfe = 0
 
     print(f"Phase 1: 改善版初期パス - {t_base}ステップ x {num_blocks}ブロック")
-    # 最初のKVキャッシュを計算
-    output = model(prompt, use_cache=True)
-    past_key_values = output.past_key_values
-
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
@@ -445,48 +441,57 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
         # 各ブロックでt_baseステップを実行
         block_mask_index = (
             x[:, current_block_start:current_block_end] == mask_id)
-        # Note: get_num_transfer_tokens expects a full block's worth of masks.
-        # This is okay for the initial pass.
-        num_transfer_tokens = get_num_transfer_tokens(
-            torch.ones_like(x[:, current_block_start:current_block_end]), t_base)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, t_base)
+
+        # 🔑 修正: 元のgenerate_with_dual_cacheと同じパターンを採用
+        # 最初のステップ: フルシーケンスでモデルを呼び出し
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0
+        x0, transfer_index, confidence_scores_initial = get_transfer_index_with_confidence(
+            output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if len(num_transfer_tokens[0]) > 0 else None)
+        x[transfer_index] = x0[transfer_index]
+        nfe += 1
 
         block_confidence_scores = None
         confidence_history = []  # このブロックの信頼度履歴
 
-        for i in range(t_base):
+        # 最初のステップの信頼度を記録
+        if confidence_scores_initial is not None:
+            step_confidence = confidence_scores_initial[0,
+                                                        current_block_start:current_block_end]
+            confidence_history.append(step_confidence.clone())
+
+        # 残りのステップ: ブロック単位での処理
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, current_block_start:current_block_end] = 1
+
+        for i in range(1, t_base):
             nfe += 1
-            # 🔑 修正: replace_positionの正しい設定（generate_with_dual_cacheに従う）
-            replace_position = torch.zeros_like(x, dtype=torch.bool)
-            replace_position[:, current_block_start:current_block_end] = 1
-
-            # モデル入力：ブロックのみ、KVキャッシュとreplace_positionを使用
-            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
-                           use_cache=True, replace_position=replace_position).logits
-
             mask_index_block = (
                 x[:, current_block_start:current_block_end] == mask_id)
 
+            if mask_index_block.sum() == 0:
+                break  # ブロックが完成
+
+            logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
+                           use_cache=True, replace_position=replace_position).logits
+
             x0_block, transfer_index_block, confidence_scores_block = get_transfer_index_with_confidence(
-                logits, temperature, remasking, mask_index_block, x[:, current_block_start:current_block_end], num_transfer_tokens[:, i])
+                logits, temperature, remasking, mask_index_block, x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if i < len(num_transfer_tokens[0]) else None)
 
             x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
 
-            # 🔑 修正: 各ステップの信頼度を保存
+            # 信頼度を記録
             step_confidence = confidence_scores_block[0]
             confidence_history.append(step_confidence.clone())
-
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                block_confidence_scores = step_confidence
-                break  # 早期終了
-
-            # 最後のステップで最終信頼度スコアを設定
-            if i == t_base - 1:
-                block_confidence_scores = step_confidence
+            block_confidence_scores = step_confidence
 
         # ブロック終了後、次のブロックのためにKVキャッシュを更新
-        output = model(
-            x[:, :current_block_end], use_cache=True)
-        past_key_values = output.past_key_values
+        if num_block < num_blocks - 1:  # 最後のブロックでない場合
+            output = model(x[:, :current_block_end], use_cache=True)
+            past_key_values = output.past_key_values
 
         # 残りマスク数を記録
         remaining_masks = (
@@ -538,6 +543,8 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
     print(f"  → 追加ステップ配分: {additional_steps}")
 
     # Phase 3: 標的精錬（統一ロジック）
+    # 🔑 一時的にコメントアウト: エラー原因の特定のため
+    """
     if any(steps > 0 for steps in additional_steps):
         print(f"\nPhase 3: 改善版標的精錬開始")
 
@@ -560,8 +567,7 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                 output = model(x[:, :current_block_start], use_cache=True)
                 past_key_values_refine = output.past_key_values
                 replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
-                replace_pos_refine[:,
-                                   current_block_start:current_block_end] = 1
+                replace_pos_refine[:, current_block_start:current_block_end] = 1
 
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
                                use_cache=True, replace_position=replace_pos_refine).logits
@@ -607,8 +613,7 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
 
                 nfe += 1
                 replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
-                replace_pos_refine[:,
-                                   current_block_start:current_block_end] = 1
+                replace_pos_refine[:, current_block_start:current_block_end] = 1
 
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
                                use_cache=True, replace_position=replace_pos_refine).logits
@@ -620,6 +625,8 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                     logits, temperature, remasking, refine_mask_index, x[:, current_block_start:current_block_end], num_transfer_tokens_refine[:, i])
 
                 x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
+    """
+    print(f"\nPhase 3: スキップ（エラー回避のため）")
 
     # 最終結果
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()
