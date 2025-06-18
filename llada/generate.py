@@ -546,7 +546,10 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
 
             # --- リファインメント実行 ---
             # KVキャッシュの準備
-            output = model(x[:, :current_block_start], use_cache=True)
+            replace_position_refine = torch.zeros(
+                (1, current_block_start), dtype=torch.bool, device=x.device)
+            output = model(x[:, :current_block_start], use_cache=True,
+                           replace_position=replace_position_refine)
             past_key_values_refine = output.past_key_values
             nfe += 1
 
