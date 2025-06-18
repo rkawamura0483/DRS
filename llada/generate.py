@@ -25,9 +25,9 @@ from tqdm import tqdm
 
 # ADAPTIVE SCHEDULING INTEGRATION
 try:
-    from .generate_adaptive import generate_with_adaptive_scheduling
-    from .adaptive_scheduler import AdaptiveInferenceScheduler
-    from .cache_manager import TieredCacheManager
+    from generate_adaptive import generate_with_adaptive_scheduling
+    from adaptive_scheduler import AdaptiveInferenceScheduler
+    from cache_manager import TieredCacheManager
     ADAPTIVE_SCHEDULING_AVAILABLE = True
 except ImportError:
     ADAPTIVE_SCHEDULING_AVAILABLE = False

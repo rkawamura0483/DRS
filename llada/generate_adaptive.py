@@ -21,13 +21,78 @@ from typing import List, Tuple, Optional, Dict, Any
 from tqdm import tqdm
 import time
 
-from .adaptive_scheduler import AdaptiveInferenceScheduler
-from .cache_manager import TieredCacheManager, CacheTier
-from .generate import (
-    add_gumbel_noise,
-    get_num_transfer_tokens,
-    get_transfer_index_with_confidence
-)
+from adaptive_scheduler import AdaptiveInferenceScheduler
+from cache_manager import TieredCacheManager, CacheTier
+
+
+def add_gumbel_noise(logits, temperature):
+    """
+    Gumbel Max サンプリング用のノイズ追加関数
+    """
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (- torch.log(noise)) ** temperature
+    return logits.exp() / gumbel_noise
+
+
+def get_num_transfer_tokens(mask_index, steps):
+    """
+    各ステップで遷移すべきトークン数を事前計算
+    """
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+    base = mask_num // steps
+    remainder = mask_num % steps
+
+    num_transfer_tokens = torch.zeros(mask_num.size(0), steps,
+                                      device=mask_index.device, dtype=torch.int64) + base
+
+    for i in range(mask_num.size(0)):
+        num_transfer_tokens[i, :remainder[i]] += 1
+
+    return num_transfer_tokens
+
+
+def get_transfer_index_with_confidence(logits, temperature, remasking, mask_index, x, num_transfer_tokens):
+    """
+    信頼度を考慮した遷移インデックスの取得
+    """
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+    # 信頼度計算（ソフトマックス確率の最大値）
+    confidence = torch.softmax(logits, dim=-1).max(dim=-1)[0]
+
+    if remasking == 'low_confidence':
+        # 低信頼度のトークンを優先的に遷移
+        mask_logits = logits.clone()
+        mask_logits[~mask_index] = -float('inf')
+
+        # 信頼度の逆順でソート
+        confidence_masked = confidence.clone()
+        confidence_masked[~mask_index] = float('inf')
+        _, sorted_indices = torch.sort(confidence_masked, descending=False)
+
+        transfer_index = torch.zeros_like(mask_index)
+        for i in range(num_transfer_tokens.item()):
+            if i < sorted_indices.size(-1):
+                transfer_index.view(-1)[sorted_indices.view(-1)[i]] = True
+
+    else:  # random
+        # ランダムに選択
+        masked_indices = torch.where(mask_index.view(-1))[0]
+        if len(masked_indices) > 0:
+            num_to_select = min(num_transfer_tokens.item(),
+                                len(masked_indices))
+            selected = torch.randperm(len(masked_indices))[:num_to_select]
+            transfer_index = torch.zeros_like(mask_index).view(-1)
+            transfer_index[masked_indices[selected]] = True
+            transfer_index = transfer_index.view(mask_index.shape)
+        else:
+            transfer_index = torch.zeros_like(mask_index)
+
+    return x0, transfer_index, confidence
 
 
 @torch.no_grad()
