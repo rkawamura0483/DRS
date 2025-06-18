@@ -412,10 +412,16 @@ def _generate_block_adaptive(
     mask_index[:, block_end:] = 0  # ブロック範囲外はマスクしない
     final_mask_index = mask_index
 
+    # ブロック範囲に限定したマスクとロジットを使用
+    actual_block_size = block_end - block_start
+    block_logits = final_logits[:, -actual_block_size:]  # ブロック分のロジットのみ
+    block_mask_index = mask_index[:, block_start:block_end]  # ブロック分のマスクのみ
+
     # トークン生成（信頼度付き）
     x0, transfer_index, confidence_probs = get_transfer_index_with_confidence(
-        final_logits, temperature, remasking, mask_index, x,
-        mask_index.sum(dim=1, keepdim=True)
+        block_logits, temperature, remasking, block_mask_index, x[:,
+                                                                  block_start:block_end],
+        block_mask_index.sum(dim=1, keepdim=True)
     )
 
     # 信頼度フィルタリング
@@ -425,13 +431,14 @@ def _generate_block_adaptive(
     else:
         final_transfer_index = transfer_index
 
-    # トークン更新
-    x[final_transfer_index] = x0[final_transfer_index]
+    # ブロック範囲でのトークン更新
+    block_x0 = x0  # ブロック分のトークン
+    x[:, block_start:block_end][final_transfer_index] = block_x0[final_transfer_index]
 
     # 信頼度スコアの計算
     if confidence_probs is not None:
-        block_confidences = confidence_probs[:, block_start:block_end]
-        confidence_scores = block_confidences[block_mask_index[0]]
+        # confidence_probsはすでにブロック範囲なので、そのまま使用
+        confidence_scores = confidence_probs[block_mask_index[0]]
 
     # キャッシュ更新
     if cache_manager is not None and confidence_scores is not None:
