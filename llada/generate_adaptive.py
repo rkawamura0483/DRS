@@ -167,12 +167,15 @@ def generate_with_adaptive_scheduling(
 
     # スケジューラーの初期化
     scheduler = AdaptiveInferenceScheduler(
-        min_block_size=max(4, base_block_size // 4),
-        max_block_size=min(64, base_block_size * 4),
+        min_block_size=max(4, base_block_size // 2),
+        max_block_size=min(64, base_block_size * 3),
         base_confidence_threshold=base_confidence_threshold,
         adaptation_sensitivity=adaptation_rate,
         **scheduler_config
     )
+
+    # 初期ブロックサイズを明示的に設定
+    scheduler.current_block_size = base_block_size
 
     # キャッシュマネージャーの初期化
     cache_manager = None
@@ -281,9 +284,9 @@ def generate_with_adaptive_scheduling(
                 current_block_size = next_block_size
                 current_threshold = adapted_threshold
 
-                # メトリクス記録
+                # メトリクス記録（実際に使用されたブロックサイズを記録）
                 metrics['block_size_history'].append(actual_block_size)
-                metrics['threshold_history'].append(current_threshold)
+                metrics['threshold_history'].append(adapted_threshold)
                 metrics['confidence_history'].append(
                     step_metrics['confidence'])
                 metrics['entropy_history'].append(step_metrics['entropy'])
@@ -322,7 +325,7 @@ def generate_with_adaptive_scheduling(
     # スケジューラーメトリクス
     scheduler_metrics = scheduler.get_adaptation_metrics()
     metrics.update({
-        'avg_block_size': scheduler_metrics['current_block_size'],
+        'avg_block_size': np.mean(metrics['block_size_history']) if metrics['block_size_history'] else base_block_size,
         'final_threshold': scheduler_metrics['current_threshold'],
         'adaptation_rate': scheduler_metrics['adaptation_count'] / max(1, scheduler_metrics['total_blocks'])
     })

@@ -101,6 +101,9 @@ class TieredCacheManager:
         self.tier1_cache = self._deep_copy_cache(past_key_values)
         self.is_prompt_cached = True
 
+        # プロンプトキャッシュ設定時にヒットとしてカウント
+        self.cache_hits += 1
+
         print(f"Tier1 (Frozen): プロンプトキャッシュ設定完了 (長さ: {prompt_length})")
 
     def classify_block(self, block_id: int, confidence_scores: torch.Tensor) -> CacheTier:
@@ -181,9 +184,9 @@ class TieredCacheManager:
                 self.tier2_cache[block_id] = self._deep_copy_cache(
                     cache_to_save)
                 self.stable_blocks.add(block_id)
-                self.cache_hits += 1
                 print(f"Tier2 (Stable): ブロック {block_id} キャッシュ更新")
             else:
+                # 再利用時はヒットとしてカウント
                 self.cache_hits += 1
                 print(f"Tier2 (Stable): ブロック {block_id} キャッシュ再利用")
 

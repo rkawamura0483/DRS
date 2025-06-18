@@ -38,13 +38,13 @@ class AdaptiveInferenceScheduler:
         min_threshold: float = 0.7,
         max_threshold: float = 0.95,
         confidence_window: int = 5,
-        adaptation_sensitivity: float = 0.15,
-        entropy_threshold_high: float = 2.0,
-        entropy_threshold_low: float = 0.5,
-        scale_up_factor: float = 1.3,
-        scale_down_factor: float = 0.8,
-        safety_factor: float = 1.1,
-        efficiency_factor: float = 0.9
+        adaptation_sensitivity: float = 0.1,  # より敏感に調整
+        entropy_threshold_high: float = 1.5,  # より低い閾値
+        entropy_threshold_low: float = 0.8,   # より高い閾値
+        scale_up_factor: float = 1.4,        # より積極的な拡大
+        scale_down_factor: float = 0.7,      # より積極的な縮小
+        safety_factor: float = 1.05,         # より小さな調整
+        efficiency_factor: float = 0.95      # より小さな調整
     ):
         """
         アダプティブスケジューラーの初期化
@@ -83,8 +83,9 @@ class AdaptiveInferenceScheduler:
 
     def reset_state(self):
         """適応状態をリセット"""
-        self.current_block_size = (
-            self.min_block_size + self.max_block_size) // 2
+        # 初期ブロックサイズは min_block_size の1.5倍程度に設定（より保守的に開始）
+        self.current_block_size = max(self.min_block_size,
+                                      min(self.min_block_size * 2, self.max_block_size))
         self.current_threshold = self.base_confidence_threshold
         self.confidence_history = deque(maxlen=self.confidence_window)
         self.entropy_history = deque(maxlen=self.confidence_window)
@@ -240,14 +241,11 @@ class AdaptiveInferenceScheduler:
         Returns:
             適応実行フラグ
         """
-        # 最初の数ステップは適応を避ける（安定化のため）
-        if step < 3:
+        # 最初のステップは適応を避ける（安定化のため）
+        if step < 1:
             return False
 
-        # 終盤では適応を控えめに
-        if step > total_steps * 0.8:
-            return step % 3 == 0  # 3ステップに1回
-
+        # 毎ステップ適応を許可（より反応的に）
         return True
 
     def get_adaptation_metrics(self) -> Dict[str, Any]:
@@ -295,9 +293,9 @@ class AdaptiveInferenceScheduler:
             # 閾値を適応
             adapted_threshold = self.adapt_threshold(entropy)
 
-            # 適応カウントを更新
+            # 適応カウントを更新（より厳密にチェック）
             if (next_block_size != self.current_block_size or
-                    abs(adapted_threshold - self.current_threshold) > 0.01):
+                    abs(adapted_threshold - self.current_threshold) > 0.005):
                 self.adaptation_count += 1
         else:
             next_block_size = self.current_block_size
