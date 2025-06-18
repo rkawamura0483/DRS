@@ -470,8 +470,8 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                 print(f"  ブロック {num_block}: {i} ステップで早期完了")
                 break
 
-            replace_position = torch.zeros_like(x, dtype=torch.bool)
-            replace_position[:, current_block_start:current_block_end] = True
+            replace_position = torch.ones(
+                (1, block_length), dtype=torch.bool, device=x.device)
 
             logits = model(x[:, current_block_start:current_block_end], past_key_values=trimmed_past_key_values,
                            use_cache=True, replace_position=replace_position).logits
@@ -560,10 +560,9 @@ def generate_with_drs(model, prompt, steps=128, gen_length=128, block_length=128
                     break
 
                 nfe += 1
-                # replace_positionはシーケンス全体で定義し、現在のブロックのみTrueにする
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:,
-                                 current_block_start:current_block_end] = True
+                # replace_positionは現在のブロック長で定義し、全てTrueにする
+                replace_position = torch.ones(
+                    (1, block_length), dtype=torch.bool, device=x.device)
 
                 # モデルには現在のブロックの入力と、プレフィックスのキャッシュを渡す
                 logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values,
