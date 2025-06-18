@@ -543,8 +543,6 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
     print(f"  → 追加ステップ配分: {additional_steps}")
 
     # Phase 3: 標的精錬（統一ロジック）
-    # 🔑 一時的にコメントアウト: エラー原因の特定のため
-    """
     if any(steps > 0 for steps in additional_steps):
         print(f"\nPhase 3: 改善版標的精錬開始")
 
@@ -563,17 +561,17 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
             if is_masked.sum().item() == 0:
                 # 完成ブロックだが曖昧度が高い場合、低信頼度トークンを再マスク
                 print(f"  精錬理由: ブロック {num_block} の信頼度ベース品質向上")
-                # 最新のKVキャッシュを取得
-                output = model(x[:, :current_block_start], use_cache=True)
-                past_key_values_refine = output.past_key_values
-                replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
-                replace_pos_refine[:, current_block_start:current_block_end] = 1
 
-                logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
-                               use_cache=True, replace_position=replace_pos_refine).logits
+                # 🔑 修正: KVキャッシュの準備を修正
+                # フルシーケンスで再計算して最新の状態を取得
+                output = model(x, use_cache=True)
+                past_key_values_refine = output.past_key_values
                 nfe += 1
 
-                p = F.softmax(logits.to(torch.float64), dim=-1)
+                # ブロック部分の信頼度を評価
+                block_logits = output.logits[:,
+                                             current_block_start:current_block_end]
+                p = F.softmax(block_logits.to(torch.float64), dim=-1)
                 current_tokens = x[:, current_block_start:current_block_end]
                 current_confidence = torch.gather(
                     p, dim=-1, index=current_tokens.unsqueeze(-1)).squeeze(-1)
@@ -589,6 +587,10 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                     f"    → ブロック {num_block} の {low_conf_mask.sum().item()} 個の低信頼度トークンを再マスクしました。")
             else:
                 print(f"  精錬理由: ブロック {num_block} の残存マスクの品質向上")
+                # 既存マスクがある場合もKVキャッシュを準備
+                output = model(x, use_cache=True)
+                past_key_values_refine = output.past_key_values
+                nfe += 1
 
             # Step 2: マスクを含むブロックを精錬
             block_mask_index = (
@@ -602,9 +604,19 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
             print(
                 f"  → ブロック {num_block} を {steps_to_add} ステップで精錬...")
 
-            # リファインメントのためのKVキャッシュを準備
-            output = model(x[:, :current_block_start], use_cache=True)
-            past_key_values_refine = output.past_key_values
+            # 🔑 修正: KVキャッシュの更新処理を修正
+            # プレフィックス部分のみを保持（現在のブロック以降を削除）
+            new_past_key_values = []
+            for i in range(len(past_key_values_refine)):
+                new_past_key_values.append(())
+                for j in range(len(past_key_values_refine[i])):
+                    new_past_key_values[i] += (past_key_values_refine[i]
+                                               [j][:, :, :current_block_start],)
+            past_key_values_refine = new_past_key_values
+
+            # リファインメントループ
+            replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
+            replace_pos_refine[:, current_block_start:current_block_end] = 1
 
             for i in range(steps_to_add):
                 if (x[:, current_block_start:current_block_end] == mask_id).sum().item() == 0:
@@ -612,21 +624,31 @@ def generate_with_drs_improved(model, prompt, steps=128, gen_length=128, block_l
                     break
 
                 nfe += 1
-                replace_pos_refine = torch.zeros_like(x, dtype=torch.bool)
-                replace_pos_refine[:, current_block_start:current_block_end] = 1
 
-                logits = model(x[:, current_block_start:current_block_end], past_key_values=past_key_values_refine,
-                               use_cache=True, replace_position=replace_pos_refine).logits
+                logits = model(x[:, current_block_start:current_block_end],
+                               past_key_values=past_key_values_refine,
+                               use_cache=True,
+                               replace_position=replace_pos_refine).logits
 
                 refine_mask_index = (
                     x[:, current_block_start:current_block_end] == mask_id)
 
+                # インデックス安全性チェック
+                if i < num_transfer_tokens_refine.shape[1]:
+                    tokens_to_transfer = num_transfer_tokens_refine[:, i]
+                else:
+                    # 残りマスク数を使用
+                    tokens_to_transfer = refine_mask_index.sum(
+                        dim=1, keepdim=True)
+
                 x0_block, transfer_index_block, _ = get_transfer_index_with_confidence(
-                    logits, temperature, remasking, refine_mask_index, x[:, current_block_start:current_block_end], num_transfer_tokens_refine[:, i])
+                    logits, temperature, remasking, refine_mask_index,
+                    x[:, current_block_start:current_block_end],
+                    tokens_to_transfer)
 
                 x[:, current_block_start:current_block_end][transfer_index_block] = x0_block[transfer_index_block]
-    """
-    print(f"\nPhase 3: スキップ（エラー回避のため）")
+    else:
+        print(f"\nPhase 3: スキップ（追加ステップなし）")
 
     # 最終結果
     final_masks = (x[:, prompt.shape[1]:] == mask_id).sum().item()

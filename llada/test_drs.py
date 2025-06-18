@@ -82,11 +82,11 @@ def test_drs_hypothesis_validation():
             input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
             # 段階的に厳しくする実験設定
-            # t_baseを小さくして、意図的にPhase1で未完成ブロックを発生させる
+            # より保守的な設定で品質を重視
             test_conditions = [
-                {'t_base': 2, 'threshold': 0.90, 'name': '挑戦的条件 (t_base=2)'},
-                {'t_base': 4, 'threshold': 0.95, 'name': '中程度条件 (t_base=4)'},
-                {'t_base': 6, 'threshold': 0.97, 'name': '厳しい条件 (t_base=6)'},
+                {'t_base': 2, 'threshold': 0.90, 'name': '保守的条件 (t_base=2)'},
+                {'t_base': 4, 'threshold': 0.90, 'name': '中程度条件 (t_base=4)'},
+                {'t_base': 8, 'threshold': 0.90, 'name': '厳しい条件 (t_base=8)'},
             ]
 
             for condition in test_conditions:
@@ -128,22 +128,42 @@ def test_drs_hypothesis_validation():
                 # === 品質を直接比較するための出力を追加 ===
                 print("\n--- 生成結果比較 ---")
                 print(f"--- [Baseline] NFE: {baseline_nfe} ---")
-                print(baseline_text)
+                print(
+                    baseline_text[:200] + "..." if len(baseline_text) > 200 else baseline_text)
                 print(
                     f"--- [DRS] NFE: {drs_nfe}, 曖昧度分散: {np.var(ambiguity_scores):.3f} ---")
-                print(drs_text)
+                print(drs_text[:200] + "..." if len(drs_text)
+                      > 200 else drs_text)
                 print("--- 比較終了 ---\n")
                 # =======================================
 
                 nfe_reduction = ((baseline_nfe - drs_nfe) / baseline_nfe) * 100
-                quality_preservation = len(
-                    drs_text.split()) / len(baseline_text.split()) * 100
+
+                # より厳密な品質指標
+                baseline_words = len(baseline_text.split())
+                drs_words = len(drs_text.split())
+
+                # 異常な反復パターンを検出
+                drs_word_list = drs_text.split()
+                repetition_score = 0
+                if len(drs_word_list) > 0:
+                    unique_words = len(set(drs_word_list))
+                    repetition_score = unique_words / len(drs_word_list)
+
+                # 品質保持率を調整（反復ペナルティ適用）
+                if baseline_words > 0:
+                    quality_preservation = (
+                        drs_words / baseline_words) * repetition_score * 100
+                else:
+                    quality_preservation = 0
 
                 # 研究仮説の検証
                 print(f"検証結果:")
                 print(
                     f"  NFE削減: {nfe_reduction:.1f}% ({baseline_nfe} → {drs_nfe})")
-                print(f"  品質保持: {quality_preservation:.1f}%")
+                print(
+                    f"  品質保持: {quality_preservation:.1f}% (反復率: {repetition_score:.3f})")
+                print(f"  単語数比較: {drs_words}/{baseline_words}")
                 print(
                     f"  難しいブロック存在: {'YES' if has_ambiguous_blocks else 'NO'}")
                 print(f"  曖昧度統計:")
