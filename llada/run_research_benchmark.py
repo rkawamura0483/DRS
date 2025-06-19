@@ -346,7 +346,7 @@ def main():
     scheduler_group = parser.add_argument_group('advanced', 'アドバンスド設定')
     scheduler_group.add_argument("--to-quality-threshold", type=float, default=0.80,
                                  help="品質モードへの切り替え閾値")
-    scheduler_group.add_argument("--to-efficiency-threshold", type=float, default=0.95,
+    scheduler_group.add_argument("--to-efficiency-threshold", type=float, default=0.90,
                                  help="効率モードへの切り替え閾値")
 
     args = parser.parse_args()
