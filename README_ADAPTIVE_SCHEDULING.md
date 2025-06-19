@@ -1,16 +1,17 @@
 # Self-Correcting Adaptive Inference Scheduling for Diffusion LLMs
 
-A novel, training-free inference optimization framework that makes diffusion-based Large Language Models dynamically adapt their generation strategy in real-time based on model uncertainty and confidence metrics.
+A novel, training-free inference optimization framework that makes diffusion-based Large Language Models dynamically adapt their generation strategy in real-time. Instead of continuous parameter adjustments, this approach switches between two distinct generation modes: **High-Efficiency** and **High-Quality**.
 
 ## 🎯 Overview
 
-Traditional Fast-dLLM approaches rely on static hyperparameters (fixed block size `B` and confidence threshold `τ`) that remain constant throughout the entire generation process. However, text generation naturally has phases of varying difficulty - some parts are predictable and "easy" while others require careful reasoning.
+Traditional Fast-dLLM approaches rely on static hyperparameters (fixed block size `B` and confidence threshold `τ`) that remain constant throughout the entire generation process. However, text generation naturally has phases of varying difficulty.
 
-**Self-Correcting Adaptive Inference Scheduling** introduces a comprehensive framework that dynamically adjusts the inference process based on real-time model confidence, enabling:
+**Self-Correcting Adaptive Inference Scheduling** introduces a framework that switches between two pre-defined operational modes based on real-time model confidence, enabling:
 
-- **Dynamic Block Sizing**: Larger blocks for confident predictions, smaller blocks for uncertain regions
-- **Adaptive Confidence Thresholding**: More parallel decoding when confident, more conservative when uncertain  
-- **Tiered Cache Management**: Intelligent cache update strategy that reduces computational redundancy
+- **Dual-Mode Strategy**: Switches between a `High-Efficiency` mode for confident predictions and a `High-Quality` mode for uncertain regions.
+- **Stable Configuration**: Avoids parameter oscillation by using fixed, optimized settings for each mode.
+- **Hysteresis-based Switching**: Prevents rapid, unstable mode changes through a robust transition logic.
+- **Tiered Cache Management**: Intelligent cache update strategy that reduces computational redundancy.
 
 ## 🏗️ Architecture
 
@@ -19,68 +20,79 @@ Traditional Fast-dLLM approaches rely on static hyperparameters (fixed block siz
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                AdaptiveInferenceScheduler                    │
-│  ┌─────────────────┐ ┌──────────────────┐ ┌─────────────────┐│
-│  │ BlockSize       │ │ Threshold        │ │ TieredCache     ││
-│  │ Controller      │ │ Controller       │ │ Manager         ││
-│  │                 │ │                  │ │                 ││
-│  │ • Dynamic sizing│ │ • Adaptive τ     │ │ • Tier 1: Frozen││
-│  │ • Confidence-   │ │ • Entropy-based  │ │ • Tier 2: Stable││
-│  │   based scaling │ │   adjustment     │ │ • Tier 3: Active││
-│  └─────────────────┘ └──────────────────┘ └─────────────────┘│
+│  ┌────────────────────────┐   ┌────────────────────────┐     │
+│  │   High-Efficiency Mode   │   │    High-Quality Mode     │     │
+│  │                        │   │                        │     │
+│  │ - Large Block Size     │   │ - Small Block Size     │     │
+│  │ - Lower τ for Speed    │   │ - Higher τ for Accuracy│     │
+│  └────────────────────────┘   └────────────────────────┘     │
+│                  ▲                                  │     │
+│                  │ (Confidence > 0.95)              │     │
+│                  ▼                                  │     │
+│  ┌────────────────────────┐                          │
+│  │   Mode Transition Logic  │                          │
+│  │ (Moving Avg. Confidence)│                          │
+│  └────────────────────────┘                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Adaptive Logic Flow
 
+The system uses a hysteresis mechanism to ensure stable transitions between modes.
+
 ```mermaid
 graph TD
-    A[Start Generation] --> B[Calculate Current Metrics]
-    B --> C{High Confidence?}
-    C -->|Yes| D[Increase Block Size<br/>Lower Threshold]
-    C -->|No| E[Decrease Block Size<br/>Raise Threshold]
-    D --> F[Generate Next Block]
-    E --> F
-    F --> G[Update Cache Tiers]
-    G --> H{Generation Complete?}
-    H -->|No| B
-    H -->|Yes| I[End]
+    A[Start in High-Efficiency Mode] --> B[Generate Block & Calculate Avg. Confidence]
+    
+    subgraph "Current Mode: High-Efficiency"
+        B --> C{"Avg. Confidence < 0.80?"};
+        C --o|No| B;
+        C -->|Yes| D[Switch to High-Quality Mode];
+    end
+
+    D --> E[Generate Block & Calculate Avg. Confidence];
+    
+    subgraph "Current Mode: High-Quality"
+        E --> F{"Avg. Confidence > 0.95?"};
+        F --o|No| E;
+        F -->|Yes| G[Switch to High-Efficiency Mode];
+    end
+
+    G --> B
+    B --> H{Generation Complete?};
+    H -->|Yes| I[End];
+
 ```
 
 ## 🔧 Technical Approach
 
-### 1. Dynamic Block Sizing
+### 1. Dual-Mode Configuration
 
-The system dynamically adjusts the next block size based on the confidence of the current block:
+The core of the system is two distinct, pre-configured modes for generation.
 
-```python
-# 現在のブロックの平均信頼度に基づいて次のブロックサイズを決定
-if avg_confidence > high_threshold:
-    next_block_size = min(max_block_size, current_block_size * scale_up_factor)
-elif avg_confidence < low_threshold:
-    next_block_size = max(min_block_size, current_block_size * scale_down_factor)
-```
+| Mode | Block Size `B` | Confidence `τ` | Goal |
+|---|---|---|---|
+| **High-Efficiency** | 32 | 0.75 | Maximize throughput on predictable text |
+| **High-Quality** | 8 | 0.95 | Maximize accuracy on complex or uncertain text |
 
-**Benefits:**
-- Allocates more computation during uncertain phases
-- Accelerates through predictable content
-- Adapts to content complexity in real-time
+This eliminates the overhead and instability of continuous, fine-grained parameter tuning.
 
-### 2. Adaptive Confidence Thresholding
+### 2. Hysteresis-based Mode Switching
 
-The confidence threshold `τ` for parallel decoding is adjusted based on prediction entropy:
+To prevent the system from oscillating rapidly between modes, we use a transition logic with a dead zone (hysteresis).
 
 ```python
-# エントロピーに基づいて信頼度閾値を動的調整
-if entropy > high_entropy_threshold:
-    τ = min(max_threshold, τ * safety_factor)  # より慎重に
-elif entropy < low_entropy_threshold:
-    τ = max(min_threshold, τ * efficiency_factor)  # より並列に
-```
+# The system switches from High-Efficiency to High-Quality
+# only when confidence drops below a low threshold.
+if current_mode == 'High-Efficiency' and avg_confidence < 0.80:
+    current_mode = 'High-Quality'
 
-**Benefits:**
-- More conservative during uncertain predictions
-- More aggressive parallel decoding when confident
-- Task-adaptive without manual tuning
+# It only switches back when confidence significantly recovers,
+# surpassing a much higher threshold.
+elif current_mode == 'High-Quality' and avg_confidence > 0.95:
+    current_mode = 'High-Efficiency'
+```
+This ensures that the mode changes only when there is a clear and sustained shift in model confidence.
 
 ### 3. Tiered Cache Management
 
@@ -105,9 +117,9 @@ A novel three-tier cache system that eliminates redundant recomputation:
 - Plug-and-play optimization
 
 ### 📊 Real-Time Adaptation
-- Confidence and entropy tracking
-- Dynamic parameter adjustment
-- Self-correcting behavior
+- Stable mode switching based on model confidence
+- Robust against parameter oscillation
+- Self-correcting behavior at a strategic level
 
 ### 🎯 Task-Agnostic
 - Adapts to math, code, creative writing, QA
@@ -117,17 +129,17 @@ A novel three-tier cache system that eliminates redundant recomputation:
 ### ⚡ Performance Optimized
 - Reduced computational redundancy
 - Intelligent resource allocation
-- Superior accuracy-throughput frontier
+- Aims for a superior accuracy-throughput frontier
 
-## 📈 Performance Benefits
+## 📈 Performance Goals
 
-Based on our evaluation across multiple benchmarks:
+This new approach is designed to outperform both static methods and fine-grained adaptive methods.
 
-| Metric | Improvement vs Static Fast-dLLM |
+| Metric | Target Improvement vs Static Fast-dLLM |
 |--------|--------------------------------|
 | **Throughput (easy content)** | +15-25% |
 | **Accuracy (complex reasoning)** | +5-12% |
-| **Cache efficiency** | +30-40% |
+| **NFE Reduction** | -10-20% |
 | **Long-sequence scaling** | +20-35% |
 
 ### Accuracy vs Throughput Frontier
@@ -135,7 +147,7 @@ Based on our evaluation across multiple benchmarks:
 ```
 Accuracy ↑
     │
-    │    ● Adaptive Scheduling
+    │    ● Adaptive Mode-Switching (Target)
     │   ╱
     │  ╱
     │ ╱ ● Static Fast-dLLM (B=32, τ=0.9)
@@ -146,6 +158,8 @@ Accuracy ↑
 ## 🛠️ Usage
 
 ### Basic Usage
+
+The new simplified API focuses on enabling the scheduler.
 
 ```python
 from generate import generate_with_adaptive_scheduling
@@ -160,46 +174,36 @@ output, metrics = generate_with_adaptive_scheduling(
     model=model,
     prompt=input_ids,
     gen_length=128,
-    base_block_size=16,          # 初期ブロックサイズ
-    base_confidence_threshold=0.8, # 初期信頼度閾値
-    adaptation_rate=0.2,         # 適応率
     enable_tiered_cache=True     # 階層キャッシュ有効化
 )
 
 # 適応メトリクスの表示
 print(f"Average block size: {metrics['avg_block_size']:.1f}")
-print(f"Cache efficiency: {metrics['cache_hit_rate']:.2%}")
-print(f"Adaptation events: {metrics['adaptations']}")
+print(f"Mode changes: {metrics['total_adaptations']}")
 ```
 
 ### Advanced Configuration
+
+You can customize the mode parameters and transition thresholds.
 
 ```python
 # 詳細設定でのアダプティブスケジューリング
 from adaptive_scheduler import AdaptiveInferenceScheduler
 from cache_manager import TieredCacheManager
 
-scheduler = AdaptiveInferenceScheduler(
-    min_block_size=8,
-    max_block_size=64,
-    confidence_window=5,         # 信頼度計算ウィンドウ
-    adaptation_sensitivity=0.15,  # 適応感度
-    entropy_threshold_high=2.0,   # 高エントロピー閾値
-    entropy_threshold_low=0.5     # 低エントロピー閾値
-)
-
-cache_manager = TieredCacheManager(
-    tier2_stability_threshold=0.85,  # Tier2昇格閾値
-    tier2_update_interval=3,         # Tier2更新間隔
-    memory_efficiency_mode=True      # メモリ効率モード
-)
+scheduler_config = {
+    'to_quality_threshold': 0.80,
+    'to_efficiency_threshold': 0.95,
+    'confidence_window_size': 2,
+    'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
+    'high_quality_params': {'block_size': 8, 'threshold': 0.95}
+}
 
 # カスタムスケジューラーで生成
-output, detailed_metrics = generate_with_custom_scheduler(
+output, detailed_metrics = generate_with_adaptive_scheduling(
     model=model,
     prompt=input_ids,
-    scheduler=scheduler,
-    cache_manager=cache_manager
+    scheduler_config=scheduler_config
 )
 ```
 
@@ -207,7 +211,7 @@ output, detailed_metrics = generate_with_custom_scheduler(
 
 ### Benchmarks
 
-The system has been evaluated on:
+The system will be evaluated on:
 
 - **GSM8K**: Math reasoning tasks
 - **HumanEval**: Code generation
@@ -215,72 +219,59 @@ The system has been evaluated on:
 - **Long-form QA**: Complex reasoning
 - **Creative Writing**: Open-ended generation
 
-### Ablation Study
-
-| Component | Accuracy Impact | Throughput Impact |
-|-----------|----------------|-------------------|
-| Dynamic Block Sizing | +3.2% | +18% |
-| Adaptive Thresholding | +2.8% | +12% |
-| Tiered Cache | +0.5% | +25% |
-| **Full System** | **+6.1%** | **+31%** |
-
 ### Running Evaluation
 
 ```bash
 # 基本評価の実行
 python test_adaptive_scheduling.py --benchmark gsm8k --model LLaDA-8B
 
-# 包括的評価（全コンポーネント）
-python test_adaptive_scheduling.py --comprehensive --ablation
-
-# 長文コンテキスト評価
-python test_adaptive_scheduling.py --long-context --seq-length 2048
+# 包括的評価
+python test_adaptive_scheduling.py --comprehensive
 ```
 
 ## 🔬 Research Insights
 
-### Adaptation Patterns
+### Expected Adaptation Patterns
 
-The system exhibits interesting adaptation patterns:
+The system is expected to exhibit clear mode-switching patterns:
 
-1. **Math Problems**: Small blocks during reasoning, larger blocks for computation
-2. **Code Generation**: Variable blocks based on complexity (loops, functions vs simple statements)
-3. **Creative Writing**: Larger blocks for narrative flow, smaller for dialogue
-4. **Q&A**: Conservative thresholds for factual content, aggressive for explanations
+1.  **Math Problems**: Switch to `High-Quality` for reasoning steps, return to `High-Efficiency` for computation.
+2.  **Code Generation**: Use `High-Quality` for complex logic (loops, functions), `High-Efficiency` for boilerplate.
+3.  **Creative Writing**: Use `High-Efficiency` for narrative, `High-Quality` for nuanced dialogue.
+4.  **Q&A**: Use `High-Quality` for factual retrieval, `High-Efficiency` for explanatory parts.
 
-### Key Findings
+### Key Hypotheses
 
-- **Content-Aware Scaling**: Block sizes correlate strongly with semantic complexity
-- **Predictive Adaptation**: System learns to anticipate difficult sections
-- **Efficiency Gains**: Most benefits come from avoiding unnecessary computation
-- **Robustness**: Performance improvements are consistent across model sizes and tasks
+- **Stability is Key**: Avoiding parameter oscillation is more important than fine-grained adaptation.
+- **Strategic Switching**: A few, well-placed mode shifts yield better results than constant adjustments.
+- **Reduced Overhead**: The simpler logic will lead to lower computational overhead and improved NFE.
+- **Robustness**: The dual-mode system will be more robust across different tasks and models.
 
-## 🏆 Advantages over Static Approaches
+## 🏆 Advantages over Other Approaches
 
-| Aspect | Static Fast-dLLM | Adaptive Scheduling |
-|--------|------------------|-------------------|
-| **Block Size** | Fixed (B=32) | Dynamic (8-64) |
-| **Confidence Threshold** | Fixed (τ=0.9) | Adaptive (0.7-0.95) |
-| **Cache Strategy** | Full recomputation | Tiered management |
-| **Content Awareness** | None | Real-time adaptation |
-| **Long Sequences** | Linear degradation | Sublinear scaling |
-| **Task Generalization** | Manual tuning | Automatic adaptation |
+| Aspect | Static Fast-dLLM | Fine-Grained Adaptation | Mode-Switching |
+|--------|------------------|---------------------------|-------------------|
+| **Strategy** | Fixed (B=32, τ=0.9) | Continuously variable | Dual-Mode |
+| **Stability** | High | Potentially Low (oscillates) | High (hysteresis) |
+| **Overhead** | Low | High | Medium |
+| **Content Awareness** | None | Real-time (micro) | Real-time (macro) |
+| **Task Generalization** | Manual tuning | Automatic but sensitive | Automatic and robust |
 
 ## 🔮 Future Directions
 
 ### Potential Extensions
 
-1. **Meta-Learning**: Learn optimal adaptation strategies from data
-2. **Multi-Modal**: Extend to vision-language models
-3. **Distributed**: Adaptive scheduling across multiple GPUs
-4. **Hardware-Aware**: Adapt to specific hardware constraints
+1.  **More Modes**: Introduce an "ultra-quality" mode for extremely difficult sections.
+2.  **Learned Modes**: Use offline analysis to learn the optimal parameters for each mode.
+3.  **Distributed**: Adaptive mode-switching across multiple GPUs.
+4.  **Hardware-Aware**: Adapt mode parameters to specific hardware constraints.
 
 ### Research Opportunities
 
-- **Theoretical Analysis**: Formal bounds on adaptive vs static performance
-- **Causality-Aware**: Integration with causal attention mechanisms  
-- **Energy Efficiency**: Optimize for both speed and power consumption
-- **Human Preference**: Align adaptation with human judgment of difficulty
+- **Theoretical Analysis**: Formal bounds on mode-switching vs. static performance.
+- **Causality-Aware**: Integrate mode-switching with causal attention mechanisms.
+- **Energy Efficiency**: Optimize modes for both speed and power consumption.
+- **Human Preference**: Align mode-switching logic with human judgment of difficulty.
 
 ## 📚 Citation
 
@@ -290,7 +281,7 @@ The system exhibits interesting adaptation patterns:
     author={[Authors]},
     journal={[Venue]},
     year={2025},
-    note={Training-free dynamic optimization for dLLM inference}
+    note={Training-free dynamic optimization for dLLM inference using mode-switching}
 }
 ```
 
@@ -304,4 +295,4 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## 🏷️ Tags
 
-`diffusion-llm` `adaptive-inference` `training-free` `optimization` `scheduling` `cache-management` `dynamic-generation` 
+`diffusion-llm` `adaptive-inference` `training-free` `optimization` `scheduling` `mode-switching` `dynamic-generation` 

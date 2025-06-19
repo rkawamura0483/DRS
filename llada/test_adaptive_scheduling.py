@@ -90,19 +90,22 @@ class AdaptiveSchedulingTester:
                 "name": "simple_qa",
                 "prompt": "What is the capital of France?",
                 "category": "factual",
-                "expected_difficulty": "low"
+                "expected_difficulty": "low",
+                "expected_mode": "HIGH_EFFICIENCY"  # 簡単な事実問題では効率モードが期待される
             },
             {
                 "name": "complex_reasoning",
                 "prompt": "Explain the relationship between quantum mechanics and general relativity in simple terms:",
                 "category": "reasoning",
-                "expected_difficulty": "high"
+                "expected_difficulty": "high",
+                "expected_mode": "HIGH_QUALITY"  # 複雑な推論では品質モードが期待される
             },
             {
                 "name": "list_generation",
                 "prompt": "List 10 benefits of regular exercise:",
                 "category": "structured",
-                "expected_difficulty": "low"
+                "expected_difficulty": "low",
+                "expected_mode": "HIGH_EFFICIENCY"  # リスト生成では効率モードが期待される
             }
         ]
 
@@ -185,33 +188,63 @@ class AdaptiveSchedulingTester:
         configurations = [
             {
                 "name": "full_system",
-                "dynamic_block": True,
-                "adaptive_threshold": True,
-                "tiered_cache": True
+                "mode_switching": True,
+                "tiered_cache": True,
+                "scheduler_config": {
+                    'to_quality_threshold': 0.80,
+                    'to_efficiency_threshold': 0.95,
+                    'confidence_window_size': 2
+                }
             },
             {
-                "name": "no_dynamic_block",
-                "dynamic_block": False,
-                "adaptive_threshold": True,
-                "tiered_cache": True
+                "name": "aggressive_switching",
+                "mode_switching": True,
+                "tiered_cache": True,
+                "scheduler_config": {
+                    'to_quality_threshold': 0.70,
+                    'to_efficiency_threshold': 0.85,
+                    'confidence_window_size': 1
+                }
             },
             {
-                "name": "no_adaptive_threshold",
-                "dynamic_block": True,
-                "adaptive_threshold": False,
-                "tiered_cache": True
+                "name": "conservative_switching",
+                "mode_switching": True,
+                "tiered_cache": True,
+                "scheduler_config": {
+                    'to_quality_threshold': 0.90,
+                    'to_efficiency_threshold': 0.98,
+                    'confidence_window_size': 3
+                }
+            },
+            {
+                "name": "efficiency_only",
+                "mode_switching": False,
+                "tiered_cache": True,
+                "scheduler_config": {
+                    'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
+                    # 効率モードのみ
+                    'high_quality_params': {'block_size': 32, 'threshold': 0.75}
+                }
+            },
+            {
+                "name": "quality_only",
+                "mode_switching": False,
+                "tiered_cache": True,
+                "scheduler_config": {
+                    'high_efficiency_params': {'block_size': 8, 'threshold': 0.95},
+                    # 品質モードのみ
+                    'high_quality_params': {'block_size': 8, 'threshold': 0.95}
+                }
             },
             {
                 "name": "no_tiered_cache",
-                "dynamic_block": True,
-                "adaptive_threshold": True,
-                "tiered_cache": False
-            },
-            {
-                "name": "minimal_system",
-                "dynamic_block": False,
-                "adaptive_threshold": False,
-                "tiered_cache": False
+                "mode_switching": True,
+                "tiered_cache": False,
+                "scheduler_config": {
+                    'to_quality_threshold': 0.80,
+                    'to_efficiency_threshold': 0.95,
+                    'confidence_window_size': 2
+                }
             }
         ]
 
@@ -289,19 +322,24 @@ class AdaptiveSchedulingTester:
         return results
 
     def _run_adaptive_scheduling(self, test_case: Dict, gen_length: int) -> Dict[str, Any]:
-        """アダプティブスケジューリングを実行"""
+        """モード切り替え式アダプティブスケジューリングを実行"""
         prompt = self.tokenizer.encode(
             test_case['prompt'], return_tensors='pt').to(self.device)
+
+        # モード切り替え式スケジューラーの設定
+        scheduler_config = {
+            'to_quality_threshold': 0.80,
+            'to_efficiency_threshold': 0.95,
+            'confidence_window_size': 2
+        }
 
         start_time = time.time()
         output, metrics = generate_with_adaptive_scheduling(
             model=self.model,
             prompt=prompt,
             gen_length=gen_length,
-            base_block_size=16,
-            base_confidence_threshold=0.8,
-            adaptation_rate=0.2,
             enable_tiered_cache=True,
+            scheduler_config=scheduler_config,
             verbose=True  # 詳細ログを有効化
         )
         end_time = time.time()
@@ -317,6 +355,8 @@ class AdaptiveSchedulingTester:
             'adaptations': metrics['total_adaptations'],
             'avg_block_size': metrics.get('avg_block_size', 0),
             'cache_hit_rate': metrics.get('cache_efficiency', {}).get('cache_hit_rate', 0),
+            'mode_changes': metrics['total_adaptations'],  # モード変更回数
+            'final_mode': metrics.get('mode_history', ['UNKNOWN'])[-1] if metrics.get('mode_history') else 'UNKNOWN',
             'generated_text': generated_text,
             'text_length': len(generated_text),
             'metrics': metrics
@@ -357,32 +397,14 @@ class AdaptiveSchedulingTester:
         prompt = self.tokenizer.encode(
             test_case['prompt'], return_tensors='pt').to(self.device)
 
-        # 設定に基づいてスケジューラーを構築
-        if config['dynamic_block']:
-            scheduler_config = {}
-        else:
-            scheduler_config = {
-                'min_block_size': 16,
-                'max_block_size': 16,  # 固定サイズ
-                'scale_up_factor': 1.0,
-                'scale_down_factor': 1.0
-            }
-
-        if not config['adaptive_threshold']:
-            scheduler_config.update({
-                'min_threshold': 0.8,
-                'max_threshold': 0.8,  # 固定閾値
-                'safety_factor': 1.0,
-                'efficiency_factor': 1.0
-            })
+        # モード切り替え方式に基づく設定
+        scheduler_config = config['scheduler_config'].copy()
 
         start_time = time.time()
         output, metrics = generate_with_adaptive_scheduling(
             model=self.model,
             prompt=prompt,
             gen_length=gen_length,
-            base_block_size=16,
-            base_confidence_threshold=0.8,
             enable_tiered_cache=config['tiered_cache'],
             scheduler_config=scheduler_config,
             verbose=True  # 詳細ログを有効化
@@ -397,6 +419,9 @@ class AdaptiveSchedulingTester:
             'total_time': end_time - start_time,
             'nfe': metrics['nfe'],
             'adaptations': metrics['total_adaptations'],
+            'mode_changes': metrics['total_adaptations'],
+            'final_mode': metrics.get('mode_history', ['UNKNOWN'])[-1] if metrics.get('mode_history') else 'UNKNOWN',
+            'avg_block_size': metrics.get('avg_block_size', 0),
             'generated_text': generated_text,
             'metrics': metrics
         }
@@ -406,7 +431,7 @@ class AdaptiveSchedulingTester:
         if not results:
             return {}
 
-        numeric_keys = ['total_time', 'nfe', 'adaptations',
+        numeric_keys = ['total_time', 'nfe', 'adaptations', 'mode_changes',
                         'avg_block_size', 'cache_hit_rate', 'text_length']
         averaged = {'method': results[0]['method']}
 
@@ -432,7 +457,7 @@ class AdaptiveSchedulingTester:
         # 全体的なメトリクス比較
         methods = list(all_results.keys())
         if len(methods) >= 2:
-            for metric in ['total_time', 'nfe', 'adaptations']:
+            for metric in ['total_time', 'nfe', 'adaptations', 'mode_changes']:
                 comparison['overall_metrics'][metric] = {}
                 for method in methods:
                     values = []
@@ -533,8 +558,54 @@ class AdaptiveSchedulingTester:
         # TODO: matplotlib を使用してプロットを作成
         pass
 
+    def quick_mode_switching_test(self, test_case_name: str = "complex_reasoning") -> Dict[str, Any]:
+        """
+        モード切り替え機能の簡単なテスト
+
+        Args:
+            test_case_name: テストするケース名
+
+        Returns:
+            テスト結果
+        """
+        print(f"\n🔄 モード切り替えテスト: {test_case_name}")
+
+        # テストケースを取得
+        test_case = next(
+            (case for case in self.test_cases if case['name'] == test_case_name), None)
+        if not test_case:
+            print(f"❌ テストケース '{test_case_name}' が見つかりません")
+            return {}
+
+        # 標準設定でテスト
+        result = self._run_adaptive_scheduling(test_case, gen_length=64)
+
+        print(f"✅ テスト完了:")
+        print(f"   実行時間: {result['total_time']:.2f}秒")
+        print(f"   NFE: {result['nfe']}")
+        print(f"   モード変更: {result['mode_changes']}回")
+        print(f"   最終モード: {result['final_mode']}")
+        print(f"   平均ブロックサイズ: {result['avg_block_size']:.1f}")
+        print(f"   期待モード: {test_case.get('expected_mode', '未定義')}")
+
+        return result
+
 
 def main():
+    """
+    使用例:
+    # 基本的なベンチマーク
+    python test_adaptive_scheduling.py --benchmark
+
+    # アブレーション研究
+    python test_adaptive_scheduling.py --ablation
+
+    # クイックテスト
+    python test_adaptive_scheduling.py --quick-test complex_reasoning
+
+    # 全評価
+    python test_adaptive_scheduling.py --comprehensive
+    """
     parser = argparse.ArgumentParser(
         description="Adaptive Scheduling Test Suite")
     parser.add_argument(
@@ -549,6 +620,8 @@ def main():
                         help="Run long context evaluation")
     parser.add_argument("--comprehensive", action="store_true",
                         help="Run all evaluations")
+    parser.add_argument("--quick-test", type=str, default=None,
+                        help="Run quick mode switching test for specific case")
     parser.add_argument("--device", default="auto", help="Device to use")
 
     args = parser.parse_args()
@@ -556,6 +629,14 @@ def main():
     # テスターの初期化
     tester = AdaptiveSchedulingTester(
         model_name=args.model, device=args.device)
+
+    if args.quick_test:
+        print("\n" + "="*50)
+        print("🔄 クイックモード切り替えテスト実行")
+        print("="*50)
+        quick_result = tester.quick_mode_switching_test(args.quick_test)
+        print("\n✅ クイックテスト完了")
+        return
 
     if args.comprehensive or args.benchmark:
         print("\n" + "="*50)
