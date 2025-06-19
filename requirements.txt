@@ -7,3 +7,6 @@ sympy
 hf_xet
 pydantic==2.10.6
 gradio
+datasets==3.0.0
+matplotlib
+tqdm
