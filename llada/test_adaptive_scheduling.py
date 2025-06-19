@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 from transformers import AutoTokenizer
 from model.modeling_llada import LLaDAModelLM
@@ -109,10 +110,145 @@ class AdaptiveSchedulingTester:
             }
         ]
 
+    def plot_confidence_movement(self, metrics: Dict[str, Any], test_case_name: str,
+                                 save_plots: bool = True, scheduler_config: Dict = None) -> None:
+        """
+        信頼度の動きとモード切り替えをプロット
+
+        Args:
+            metrics: 生成メトリクス
+            test_case_name: テストケース名
+            save_plots: プロットを保存するか
+            scheduler_config: スケジューラー設定（閾値線の表示用）
+        """
+        if 'confidence_history' not in metrics or 'mode_history' not in metrics:
+            print("❌ 信頼度履歴またはモード履歴が見つかりません")
+            return
+
+        confidence_history = metrics['confidence_history']
+        mode_history = metrics['mode_history']
+
+        if len(confidence_history) == 0:
+            print("❌ 信頼度履歴が空です")
+            return
+
+        # デフォルト閾値
+        quality_threshold = 0.80
+        efficiency_threshold = 0.95
+
+        # スケジューラー設定から閾値を取得
+        if scheduler_config:
+            quality_threshold = scheduler_config.get(
+                'to_quality_threshold', 0.80)
+            efficiency_threshold = scheduler_config.get(
+                'to_efficiency_threshold', 0.95)
+
+        # プロットの設定
+        plt.figure(figsize=(12, 8))
+
+        # 上段: 信頼度の変化
+        plt.subplot(2, 1, 1)
+        steps = range(len(confidence_history))
+        plt.plot(steps, confidence_history, 'b-',
+                 linewidth=2, label='Confidence')
+
+        # 閾値線を追加
+        plt.axhline(y=quality_threshold, color='r', linestyle='--',
+                    alpha=0.7, label=f'Quality Threshold ({quality_threshold})')
+        plt.axhline(y=efficiency_threshold, color='g', linestyle='--', alpha=0.7,
+                    label=f'Efficiency Threshold ({efficiency_threshold})')
+
+        # モード変更点をハイライト
+        mode_changes = []
+        for i in range(1, len(mode_history)):
+            if mode_history[i] != mode_history[i-1]:
+                mode_changes.append(i)
+                plt.axvline(x=i, color='orange', linestyle=':', alpha=0.8)
+
+        plt.ylabel('Confidence', fontsize=12)
+        plt.title(
+            f'Confidence Movement - {test_case_name}', fontsize=14, fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0, 1)
+
+        # 下段: モード切り替え
+        plt.subplot(2, 1, 2)
+
+        # モードを数値に変換 (HIGH_EFFICIENCY=1, HIGH_QUALITY=0)
+        mode_numeric = [1 if mode ==
+                        'HIGH_EFFICIENCY' else 0 for mode in mode_history]
+
+        # モード切り替えを色分けして表示
+        for i in range(len(mode_numeric)):
+            color = 'lightgreen' if mode_numeric[i] == 1 else 'lightcoral'
+            label = 'High-Efficiency' if mode_numeric[i] == 1 else 'High-Quality'
+
+            # 最初の出現時のみラベルを付ける
+            if i == 0 or (i > 0 and mode_numeric[i] != mode_numeric[i-1]):
+                plt.bar(i, 1, color=color, alpha=0.7, label=label if i == 0 or label not in [
+                        item.get_label() for item in plt.gca().get_legend_handles_labels()[1]] else "")
+            else:
+                plt.bar(i, 1, color=color, alpha=0.7)
+
+        plt.ylabel('Mode', fontsize=12)
+        plt.xlabel('Generation Step', fontsize=12)
+        plt.title('Mode Switching Pattern', fontsize=14, fontweight='bold')
+        plt.yticks([0, 1], ['High-Quality', 'High-Efficiency'])
+
+        # 重複ラベルを避ける
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        plt.legend(by_label.values(), by_label.keys())
+
+        plt.grid(True, alpha=0.3, axis='x')
+
+        plt.tight_layout()
+
+        # プロットの保存
+        if save_plots:
+            output_dir = Path("confidence_plots")
+            output_dir.mkdir(exist_ok=True)
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = output_dir / \
+                f"confidence_{test_case_name}_{timestamp}.png"
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+            print(f"📊 信頼度プロットを保存: {filename}")
+
+        plt.show()
+
+        # 統計情報を表示
+        self._print_confidence_stats(
+            confidence_history, mode_history, mode_changes)
+
+    def _print_confidence_stats(self, confidence_history: List[float],
+                                mode_history: List[str], mode_changes: List[int]) -> None:
+        """信頼度統計情報を表示"""
+        print(f"\n📈 信頼度統計:")
+        print(f"   平均信頼度: {np.mean(confidence_history):.3f}")
+        print(f"   最小信頼度: {np.min(confidence_history):.3f}")
+        print(f"   最大信頼度: {np.max(confidence_history):.3f}")
+        print(f"   信頼度標準偏差: {np.std(confidence_history):.3f}")
+        print(f"   モード変更回数: {len(mode_changes)}")
+
+        # モード別時間統計
+        efficiency_steps = sum(
+            1 for mode in mode_history if mode == 'HIGH_EFFICIENCY')
+        quality_steps = sum(
+            1 for mode in mode_history if mode == 'HIGH_QUALITY')
+        total_steps = len(mode_history)
+
+        print(
+            f"   効率モード時間: {efficiency_steps}/{total_steps} ({efficiency_steps/total_steps*100:.1f}%)")
+        print(
+            f"   品質モード時間: {quality_steps}/{total_steps} ({quality_steps/total_steps*100:.1f}%)")
+
     def run_comprehensive_benchmark(self,
                                     gen_length: int = 128,
                                     num_runs: int = 3,
-                                    save_results: bool = True) -> Dict[str, Any]:
+                                    save_results: bool = True,
+                                    scheduler_config: Dict = None) -> Dict[str, Any]:
         """
         包括的ベンチマークを実行
 
@@ -120,6 +256,7 @@ class AdaptiveSchedulingTester:
             gen_length: 生成長
             num_runs: 実行回数（平均を取る）
             save_results: 結果を保存するか
+            scheduler_config: スケジューラー設定
 
         Returns:
             ベンチマーク結果
@@ -128,8 +265,11 @@ class AdaptiveSchedulingTester:
         print(f"   生成長: {gen_length}")
         print(f"   実行回数: {num_runs}")
 
+        if scheduler_config:
+            print(f"   スケジューラー設定: {scheduler_config}")
+
         methods = {
-            "adaptive_scheduling": self._run_adaptive_scheduling,
+            "adaptive_scheduling": lambda tc, gl: self._run_adaptive_scheduling(tc, gl, scheduler_config),
             "dual_cache": self._run_dual_cache,
         }
 
@@ -169,38 +309,51 @@ class AdaptiveSchedulingTester:
             'config': {
                 'gen_length': gen_length,
                 'num_runs': num_runs,
-                'test_cases': len(self.test_cases)
+                'test_cases': len(self.test_cases),
+                'scheduler_config': scheduler_config
             }
         }
 
-    def run_ablation_study(self, gen_length: int = 128) -> Dict[str, Any]:
+    def run_ablation_study(self, gen_length: int = 128,
+                           base_scheduler_config: Dict = None) -> Dict[str, Any]:
         """
         アブレーション研究を実行
 
         Args:
             gen_length: 生成長
+            base_scheduler_config: ベーススケジューラー設定
 
         Returns:
             アブレーション結果
         """
         print(f"\n🔬 アブレーション研究開始")
 
+        # デフォルト設定
+        default_config = {
+            'to_quality_threshold': 0.80,
+            'to_efficiency_threshold': 0.95,
+            'confidence_window_size': 2,
+            'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
+            'high_quality_params': {'block_size': 8, 'threshold': 0.95}
+        }
+
+        # ベース設定があればマージ
+        if base_scheduler_config:
+            default_config.update(base_scheduler_config)
+
         configurations = [
             {
                 "name": "full_system",
                 "mode_switching": True,
                 "tiered_cache": True,
-                "scheduler_config": {
-                    'to_quality_threshold': 0.80,
-                    'to_efficiency_threshold': 0.95,
-                    'confidence_window_size': 2
-                }
+                "scheduler_config": default_config.copy()
             },
             {
                 "name": "aggressive_switching",
                 "mode_switching": True,
                 "tiered_cache": True,
                 "scheduler_config": {
+                    **default_config,
                     'to_quality_threshold': 0.70,
                     'to_efficiency_threshold': 0.85,
                     'confidence_window_size': 1
@@ -211,6 +364,7 @@ class AdaptiveSchedulingTester:
                 "mode_switching": True,
                 "tiered_cache": True,
                 "scheduler_config": {
+                    **default_config,
                     'to_quality_threshold': 0.90,
                     'to_efficiency_threshold': 0.98,
                     'confidence_window_size': 3
@@ -221,9 +375,8 @@ class AdaptiveSchedulingTester:
                 "mode_switching": False,
                 "tiered_cache": True,
                 "scheduler_config": {
-                    'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
-                    # 効率モードのみ
-                    'high_quality_params': {'block_size': 32, 'threshold': 0.75}
+                    **default_config,
+                    'high_quality_params': default_config['high_efficiency_params'].copy()
                 }
             },
             {
@@ -231,20 +384,15 @@ class AdaptiveSchedulingTester:
                 "mode_switching": False,
                 "tiered_cache": True,
                 "scheduler_config": {
-                    'high_efficiency_params': {'block_size': 8, 'threshold': 0.95},
-                    # 品質モードのみ
-                    'high_quality_params': {'block_size': 8, 'threshold': 0.95}
+                    **default_config,
+                    'high_efficiency_params': default_config['high_quality_params'].copy()
                 }
             },
             {
                 "name": "no_tiered_cache",
                 "mode_switching": True,
                 "tiered_cache": False,
-                "scheduler_config": {
-                    'to_quality_threshold': 0.80,
-                    'to_efficiency_threshold': 0.95,
-                    'confidence_window_size': 2
-                }
+                "scheduler_config": default_config.copy()
             }
         ]
 
@@ -274,12 +422,14 @@ class AdaptiveSchedulingTester:
             'configurations': configurations
         }
 
-    def run_long_context_evaluation(self, seq_lengths: List[int] = [512, 1024, 2048]) -> Dict[str, Any]:
+    def run_long_context_evaluation(self, seq_lengths: List[int] = [512, 1024, 2048],
+                                    scheduler_config: Dict = None) -> Dict[str, Any]:
         """
         長文コンテキスト評価
 
         Args:
             seq_lengths: 評価するシーケンス長のリスト
+            scheduler_config: スケジューラー設定
 
         Returns:
             長文コンテキスト評価結果
@@ -301,7 +451,7 @@ class AdaptiveSchedulingTester:
 
             # アダプティブスケジューリング
             adaptive_result = self._run_adaptive_scheduling(
-                long_context_case, seq_length)
+                long_context_case, seq_length, scheduler_config)
 
             # 静的手法（比較用）
             static_result = self._run_dual_cache(long_context_case, seq_length)
@@ -321,17 +471,26 @@ class AdaptiveSchedulingTester:
 
         return results
 
-    def _run_adaptive_scheduling(self, test_case: Dict, gen_length: int) -> Dict[str, Any]:
+    def _run_adaptive_scheduling(self, test_case: Dict, gen_length: int,
+                                 scheduler_config: Dict = None) -> Dict[str, Any]:
         """モード切り替え式アダプティブスケジューリングを実行"""
         prompt = self.tokenizer.encode(
             test_case['prompt'], return_tensors='pt').to(self.device)
 
-        # モード切り替え式スケジューラーの設定
-        scheduler_config = {
+        # デフォルト設定
+        default_scheduler_config = {
             'to_quality_threshold': 0.80,
             'to_efficiency_threshold': 0.95,
-            'confidence_window_size': 2
+            'confidence_window_size': 2,
+            'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
+            'high_quality_params': {'block_size': 8, 'threshold': 0.95}
         }
+
+        # 設定をマージ
+        if scheduler_config:
+            final_config = {**default_scheduler_config, **scheduler_config}
+        else:
+            final_config = default_scheduler_config
 
         start_time = time.time()
         output, metrics = generate_with_adaptive_scheduling(
@@ -339,7 +498,7 @@ class AdaptiveSchedulingTester:
             prompt=prompt,
             gen_length=gen_length,
             enable_tiered_cache=True,
-            scheduler_config=scheduler_config,
+            scheduler_config=final_config,
             verbose=True  # 詳細ログを有効化
         )
         end_time = time.time()
@@ -359,7 +518,8 @@ class AdaptiveSchedulingTester:
             'final_mode': metrics.get('mode_history', ['UNKNOWN'])[-1] if metrics.get('mode_history') else 'UNKNOWN',
             'generated_text': generated_text,
             'text_length': len(generated_text),
-            'metrics': metrics
+            'metrics': metrics,
+            'scheduler_config': final_config
         }
 
     def _run_dual_cache(self, test_case: Dict, gen_length: int) -> Dict[str, Any]:
@@ -558,12 +718,17 @@ class AdaptiveSchedulingTester:
         # TODO: matplotlib を使用してプロットを作成
         pass
 
-    def quick_mode_switching_test(self, test_case_name: str = "complex_reasoning") -> Dict[str, Any]:
+    def quick_mode_switching_test(self, test_case_name: str = "complex_reasoning",
+                                  gen_length: int = 64, scheduler_config: Dict = None,
+                                  plot_confidence: bool = True) -> Dict[str, Any]:
         """
         モード切り替え機能の簡単なテスト
 
         Args:
             test_case_name: テストするケース名
+            gen_length: 生成長
+            scheduler_config: スケジューラー設定
+            plot_confidence: 信頼度をプロットするか
 
         Returns:
             テスト結果
@@ -577,8 +742,9 @@ class AdaptiveSchedulingTester:
             print(f"❌ テストケース '{test_case_name}' が見つかりません")
             return {}
 
-        # 標準設定でテスト
-        result = self._run_adaptive_scheduling(test_case, gen_length=64)
+        # 設定でテスト実行
+        result = self._run_adaptive_scheduling(
+            test_case, gen_length, scheduler_config)
 
         print(f"✅ テスト完了:")
         print(f"   実行時間: {result['total_time']:.2f}秒")
@@ -587,8 +753,177 @@ class AdaptiveSchedulingTester:
         print(f"   最終モード: {result['final_mode']}")
         print(f"   平均ブロックサイズ: {result['avg_block_size']:.1f}")
         print(f"   期待モード: {test_case.get('expected_mode', '未定義')}")
+        print(f"   使用設定: {result['scheduler_config']}")
+
+        # 信頼度プロットを生成
+        if plot_confidence and 'metrics' in result:
+            print(f"\n📊 信頼度プロット生成中...")
+            self.plot_confidence_movement(result['metrics'], test_case_name,
+                                          save_plots=True, scheduler_config=scheduler_config)
 
         return result
+
+    def compare_parameter_settings(self, test_case_name: str = "complex_reasoning",
+                                   gen_length: int = 64) -> None:
+        """
+        異なるパラメータ設定を比較
+
+        Args:
+            test_case_name: テストするケース名
+            gen_length: 生成長
+        """
+        print(f"\n🔍 パラメータ設定比較: {test_case_name}")
+
+        # 異なる設定を定義
+        configurations = [
+            {
+                'name': 'デフォルト',
+                'config': {
+                    'to_quality_threshold': 0.80,
+                    'to_efficiency_threshold': 0.95,
+                    'confidence_window_size': 2
+                }
+            },
+            {
+                'name': 'アグレッシブ',
+                'config': {
+                    'to_quality_threshold': 0.70,
+                    'to_efficiency_threshold': 0.85,
+                    'confidence_window_size': 1
+                }
+            },
+            {
+                'name': '保守的',
+                'config': {
+                    'to_quality_threshold': 0.90,
+                    'to_efficiency_threshold': 0.98,
+                    'confidence_window_size': 3
+                }
+            }
+        ]
+
+        results = {}
+
+        for config_info in configurations:
+            print(f"\n🧪 テスト中: {config_info['name']}")
+
+            # ベース設定を更新
+            full_config = {
+                **config_info['config'],
+                'high_efficiency_params': {'block_size': 32, 'threshold': 0.75},
+                'high_quality_params': {'block_size': 8, 'threshold': 0.95}
+            }
+
+            result = self.quick_mode_switching_test(
+                test_case_name=test_case_name,
+                gen_length=gen_length,
+                scheduler_config=full_config,
+                plot_confidence=False  # 比較時は個別プロットを無効化
+            )
+
+            results[config_info['name']] = {
+                'result': result,
+                'config': full_config
+            }
+
+        # 比較結果を表示
+        print(f"\n📊 設定比較結果:")
+        print(f"{'設定':<12} {'時間(s)':<10} {'NFE':<8} {'モード変更':<10} {'効率モード(%)':<15}")
+        print("-" * 65)
+
+        for name, data in results.items():
+            result = data['result']
+            if 'metrics' in result:
+                metrics = result['metrics']
+                mode_history = metrics.get('mode_history', [])
+                efficiency_percent = sum(1 for mode in mode_history if mode ==
+                                         'HIGH_EFFICIENCY') / len(mode_history) * 100 if mode_history else 0
+
+                print(
+                    f"{name:<12} {result['total_time']:<10.2f} {result['nfe']:<8} {result['mode_changes']:<10} {efficiency_percent:<15.1f}")
+
+        # 統合プロットを作成（すべての設定の信頼度を重ねて表示）
+        self._create_comparison_plot(results, test_case_name)
+
+    def _create_comparison_plot(self, results: Dict, test_case_name: str) -> None:
+        """
+        複数設定の比較プロットを作成
+
+        Args:
+            results: 比較結果
+            test_case_name: テストケース名
+        """
+        plt.figure(figsize=(15, 10))
+
+        colors = ['blue', 'red', 'green', 'purple', 'orange']
+
+        # 上段: 信頼度比較
+        plt.subplot(2, 1, 1)
+
+        for i, (name, data) in enumerate(results.items()):
+            result = data['result']
+            config = data['config']
+
+            if 'metrics' in result and 'confidence_history' in result['metrics']:
+                confidence_history = result['metrics']['confidence_history']
+                steps = range(len(confidence_history))
+
+                plt.plot(steps, confidence_history,
+                         color=colors[i % len(colors)], linewidth=2, label=f'{name}')
+
+                # 各設定の閾値線
+                quality_threshold = config.get('to_quality_threshold', 0.80)
+                efficiency_threshold = config.get(
+                    'to_efficiency_threshold', 0.95)
+
+                plt.axhline(y=quality_threshold, color=colors[i % len(colors)],
+                            linestyle='--', alpha=0.3, linewidth=1)
+                plt.axhline(y=efficiency_threshold, color=colors[i % len(colors)],
+                            linestyle=':', alpha=0.3, linewidth=1)
+
+        plt.ylabel('Confidence', fontsize=12)
+        plt.title(
+            f'Confidence Comparison - {test_case_name}', fontsize=14, fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.ylim(0, 1)
+
+        # 下段: モード切り替えパターン比較
+        plt.subplot(2, 1, 2)
+
+        for i, (name, data) in enumerate(results.items()):
+            result = data['result']
+
+            if 'metrics' in result and 'mode_history' in result['metrics']:
+                mode_history = result['metrics']['mode_history']
+                mode_numeric = [
+                    1 if mode == 'HIGH_EFFICIENCY' else 0 for mode in mode_history]
+                steps = range(len(mode_numeric))
+
+                # オフセットを使用して複数の設定を表示
+                offset = i * 0.2
+                plt.plot(steps, [m + offset for m in mode_numeric],
+                         color=colors[i % len(colors)], linewidth=2, label=f'{name}',
+                         marker='o', markersize=3, alpha=0.7)
+
+        plt.ylabel('Mode + Offset', fontsize=12)
+        plt.xlabel('Generation Step', fontsize=12)
+        plt.title('Mode Switching Comparison', fontsize=14, fontweight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # プロットを保存
+        output_dir = Path("confidence_plots")
+        output_dir.mkdir(exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = output_dir / f"comparison_{test_case_name}_{timestamp}.png"
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"📊 比較プロットを保存: {filename}")
+
+        plt.show()
 
 
 def main():
@@ -600,18 +935,32 @@ def main():
     # アブレーション研究
     python test_adaptive_scheduling.py --ablation
 
-    # クイックテスト
+    # クイックテスト（デフォルト設定）
     python test_adaptive_scheduling.py --quick-test complex_reasoning
+
+    # クイックテスト（カスタム設定）
+    python test_adaptive_scheduling.py --quick-test complex_reasoning --to-quality-threshold 0.75 --to-efficiency-threshold 0.90 --efficiency-block-size 16
+
+    # パラメータ設定比較
+    python test_adaptive_scheduling.py --compare-settings complex_reasoning
+
+    # プロット無効化
+    python test_adaptive_scheduling.py --quick-test simple_qa --no-plot
 
     # 全評価
     python test_adaptive_scheduling.py --comprehensive
     """
     parser = argparse.ArgumentParser(
         description="Adaptive Scheduling Test Suite")
+
+    # 基本パラメータ
     parser.add_argument(
         "--model", default="GSAI-ML/LLaDA-8B-Instruct", help="Model name")
     parser.add_argument("--gen-length", type=int,
                         default=128, help="Generation length")
+    parser.add_argument("--device", default="auto", help="Device to use")
+
+    # 実行モード
     parser.add_argument("--benchmark", action="store_true",
                         help="Run comprehensive benchmark")
     parser.add_argument("--ablation", action="store_true",
@@ -622,9 +971,68 @@ def main():
                         help="Run all evaluations")
     parser.add_argument("--quick-test", type=str, default=None,
                         help="Run quick mode switching test for specific case")
-    parser.add_argument("--device", default="auto", help="Device to use")
+    parser.add_argument("--compare-settings", type=str, default=None,
+                        help="Compare different parameter settings for specific case")
+
+    # スケジューラー設定パラメータ
+    scheduler_group = parser.add_argument_group(
+        'scheduler', 'Adaptive Scheduler Configuration')
+    scheduler_group.add_argument("--to-quality-threshold", type=float, default=0.80,
+                                 help="Confidence threshold to switch to HIGH_QUALITY mode (default: 0.80)")
+    scheduler_group.add_argument("--to-efficiency-threshold", type=float, default=0.95,
+                                 help="Confidence threshold to switch to HIGH_EFFICIENCY mode (default: 0.95)")
+    scheduler_group.add_argument("--confidence-window-size", type=int, default=2,
+                                 help="Window size for confidence smoothing (default: 2)")
+
+    # 効率モードパラメータ
+    efficiency_group = parser.add_argument_group(
+        'efficiency_mode', 'High-Efficiency Mode Parameters')
+    efficiency_group.add_argument("--efficiency-block-size", type=int, default=32,
+                                  help="Block size for HIGH_EFFICIENCY mode (default: 32)")
+    efficiency_group.add_argument("--efficiency-threshold", type=float, default=0.75,
+                                  help="Confidence threshold for HIGH_EFFICIENCY mode (default: 0.75)")
+
+    # 品質モードパラメータ
+    quality_group = parser.add_argument_group(
+        'quality_mode', 'High-Quality Mode Parameters')
+    quality_group.add_argument("--quality-block-size", type=int, default=8,
+                               help="Block size for HIGH_QUALITY mode (default: 8)")
+    quality_group.add_argument("--quality-threshold", type=float, default=0.95,
+                               help="Confidence threshold for HIGH_QUALITY mode (default: 0.95)")
+
+    # プロット設定
+    plot_group = parser.add_argument_group('plotting', 'Plotting Options')
+    plot_group.add_argument("--no-plot", action="store_true",
+                            help="Disable confidence plotting for quick test")
+    plot_group.add_argument("--save-plots", action="store_true", default=True,
+                            help="Save plots to files (default: True)")
 
     args = parser.parse_args()
+
+    # スケジューラー設定を構築
+    scheduler_config = {
+        'to_quality_threshold': args.to_quality_threshold,
+        'to_efficiency_threshold': args.to_efficiency_threshold,
+        'confidence_window_size': args.confidence_window_size,
+        'high_efficiency_params': {
+            'block_size': args.efficiency_block_size,
+            'threshold': args.efficiency_threshold
+        },
+        'high_quality_params': {
+            'block_size': args.quality_block_size,
+            'threshold': args.quality_threshold
+        }
+    }
+
+    # 設定の表示
+    print(f"🔧 スケジューラー設定:")
+    print(f"   効率→品質閾値: {args.to_quality_threshold}")
+    print(f"   品質→効率閾値: {args.to_efficiency_threshold}")
+    print(f"   信頼度ウィンドウ: {args.confidence_window_size}")
+    print(
+        f"   効率モード: ブロックサイズ={args.efficiency_block_size}, 閾値={args.efficiency_threshold}")
+    print(
+        f"   品質モード: ブロックサイズ={args.quality_block_size}, 閾値={args.quality_threshold}")
 
     # テスターの初期化
     tester = AdaptiveSchedulingTester(
@@ -634,8 +1042,24 @@ def main():
         print("\n" + "="*50)
         print("🔄 クイックモード切り替えテスト実行")
         print("="*50)
-        quick_result = tester.quick_mode_switching_test(args.quick_test)
+        quick_result = tester.quick_mode_switching_test(
+            test_case_name=args.quick_test,
+            gen_length=args.gen_length,
+            scheduler_config=scheduler_config,
+            plot_confidence=not args.no_plot
+        )
         print("\n✅ クイックテスト完了")
+        return
+
+    if args.compare_settings:
+        print("\n" + "="*50)
+        print("🔍 パラメータ設定比較実行")
+        print("="*50)
+        tester.compare_parameter_settings(
+            test_case_name=args.compare_settings,
+            gen_length=args.gen_length
+        )
+        print("\n✅ 設定比較完了")
         return
 
     if args.comprehensive or args.benchmark:
@@ -643,7 +1067,8 @@ def main():
         print("🚀 包括的ベンチマーク実行")
         print("="*50)
         benchmark_results = tester.run_comprehensive_benchmark(
-            gen_length=args.gen_length)
+            gen_length=args.gen_length,
+            scheduler_config=scheduler_config)
         print("\n✅ ベンチマーク完了")
 
     if args.comprehensive or args.ablation:
@@ -651,14 +1076,16 @@ def main():
         print("🔬 アブレーション研究実行")
         print("="*50)
         ablation_results = tester.run_ablation_study(
-            gen_length=args.gen_length)
+            gen_length=args.gen_length,
+            base_scheduler_config=scheduler_config)
         print("\n✅ アブレーション研究完了")
 
     if args.comprehensive or args.long_context:
         print("\n" + "="*50)
         print("📏 長文コンテキスト評価実行")
         print("="*50)
-        long_context_results = tester.run_long_context_evaluation()
+        long_context_results = tester.run_long_context_evaluation(
+            scheduler_config=scheduler_config)
         print("\n✅ 長文コンテキスト評価完了")
 
     print("\n🎉 全評価完了!")
