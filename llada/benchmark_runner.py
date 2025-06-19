@@ -112,18 +112,46 @@ class BenchmarkRunner:
         # MATH データセット
         print("   MATH読み込み中...")
         try:
-            math_dataset = load_dataset("competition_math", split="test")
-            datasets["math"] = [
-                {
-                    "dataset": "math",
-                    "id": i,
-                    "question": item["problem"],
-                    "answer": item["solution"],
-                    "type": "math"
-                }
-                for i, item in enumerate(math_dataset.select(range(min(samples_per_dataset, len(math_dataset)))))
+            # 複数の代替データセットを試行
+            alternative_datasets = [
+                ("lighteval/MATH-Hard", "test"),
+                ("DigitalLearningGmbH/MATH-lighteval", "test"),
+                ("EleutherAI/hendrycks_math", "algebra", "test")  # サブセットを指定
             ]
-            print(f"     ✅ MATH: {len(datasets['math'])}サンプル")
+
+            math_dataset = None
+            for dataset_info in alternative_datasets:
+                try:
+                    if len(dataset_info) == 3:
+                        # サブセット指定がある場合
+                        dataset_name, subset, split = dataset_info
+                        math_dataset = load_dataset(
+                            dataset_name, subset, split=split)
+                    else:
+                        # サブセット指定がない場合
+                        dataset_name, split = dataset_info
+                        math_dataset = load_dataset(dataset_name, split=split)
+                    print(f"     📊 使用データセット: {dataset_name}")
+                    break
+                except Exception as sub_e:
+                    print(f"     ⚠️  {dataset_name} 失敗: {sub_e}")
+                    continue
+
+            if math_dataset is not None:
+                datasets["math"] = [
+                    {
+                        "dataset": "math",
+                        "id": i,
+                        "question": item.get("problem", item.get("question", "")),
+                        "answer": item.get("solution", item.get("answer", "")),
+                        "type": "math"
+                    }
+                    for i, item in enumerate(math_dataset.select(range(min(samples_per_dataset, len(math_dataset)))))
+                ]
+                print(f"     ✅ MATH: {len(datasets['math'])}サンプル")
+            else:
+                print(f"     ❌ MATH: 利用可能なデータセットがありません")
+                datasets["math"] = []
         except Exception as e:
             print(f"     ❌ MATH読み込みエラー: {e}")
             datasets["math"] = []
