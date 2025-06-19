@@ -286,10 +286,29 @@ class BenchmarkRunner:
             抽出された答え
         """
         if sample["type"] == "math":
-            # 数学問題: 数値を抽出
-            # 最後の数値を答えとして取得
-            numbers = re.findall(r'-?\d+\.?\d*', generated_text)
-            return numbers[-1] if numbers else ""
+            # 数学問題: より堅牢な数値抽出
+            # "Answer:" や "=" の後の数値、または最後の独立した数値を抽出
+
+            # 答えを示すキーワードの後の数値を探す
+            answer_patterns = [
+                r'(?:answer|result|solution|equals?|=)\s*:?\s*([\d,]+(?:\.\d+)?)',
+                r'\\boxed\{([\d,]+(?:\.\d+)?)\}',  # LaTeX形式
+                r'([\d,]+(?:\.\d+)?)\s*$',  # 行末の数値
+            ]
+
+            for pattern in answer_patterns:
+                matches = re.findall(pattern, generated_text, re.IGNORECASE)
+                if matches:
+                    # カンマを削除して数値として処理
+                    return matches[-1].replace(',', '')
+
+            # フォールバック: 全ての数値から最後を選択（カンマ処理付き）
+            numbers = re.findall(
+                r'-?\d{1,3}(?:,\d{3})*(?:\.\d+)?', generated_text)
+            if numbers:
+                return numbers[-1].replace(',', '')
+
+            return ""
 
         elif sample["type"] == "code":
             # コード問題: 関数定義を抽出
@@ -320,11 +339,45 @@ class BenchmarkRunner:
                 if code_match:
                     return code_match.group(1)
 
-                # def で始まる行から推測
+                # より堅牢なMBPP関数抽出: 完全な関数定義を抽出
                 lines = generated_text.split('\n')
                 for i, line in enumerate(lines):
                     if line.strip().startswith('def '):
-                        return '\n'.join(lines[i:i+10])  # 10行まで取得
+                        # 関数の開始を見つけた
+                        code_lines = [line]
+                        indent_level = len(line) - len(line.lstrip())
+
+                        # 関数の本体を抽出（インデントに基づく）
+                        j = i + 1
+                        while j < len(lines):
+                            current_line = lines[j]
+
+                            # 空行はスキップ
+                            if current_line.strip() == '':
+                                code_lines.append(current_line)
+                                j += 1
+                                continue
+
+                            # インデントレベルをチェック
+                            current_indent = len(
+                                current_line) - len(current_line.lstrip())
+
+                            # 関数のインデントレベル以下の行が出てきたら終了
+                            if current_indent <= indent_level and current_line.strip():
+                                # ただし、次の関数定義でない場合は含める可能性
+                                if not current_line.strip().startswith('def '):
+                                    break
+                                else:
+                                    break
+
+                            code_lines.append(current_line)
+                            j += 1
+
+                            # 安全装置: 50行を超えたら終了
+                            if len(code_lines) > 50:
+                                break
+
+                        return '\n'.join(code_lines)
 
                 return generated_text[:200]  # フォールバック
 
@@ -342,23 +395,44 @@ class BenchmarkRunner:
             正解かどうか
         """
         try:
-            # 数値抽出
-            gen_nums = re.findall(r'-?\d+\.?\d*', generated_answer)
-            correct_nums = re.findall(r'-?\d+\.?\d*', correct_answer)
+            # カンマ区切り数値を処理する改良された正規表現
+            number_pattern = r'-?\d{1,3}(?:,\d{3})*(?:\.\d+)?'
+
+            # 生成された答えから数値を抽出（カンマを削除）
+            gen_nums_raw = re.findall(number_pattern, generated_answer)
+            gen_nums = [num.replace(',', '') for num in gen_nums_raw]
+
+            # 正解から数値を抽出（カンマを削除）
+            correct_nums_raw = re.findall(number_pattern, correct_answer)
+            correct_nums = [num.replace(',', '') for num in correct_nums_raw]
 
             if not gen_nums or not correct_nums:
-                return False
+                # 数値が見つからない場合、文字列の完全一致でフォールバック
+                return generated_answer.strip().lower() == correct_answer.strip().lower()
 
             # 最後の数値を比較
             gen_val = float(gen_nums[-1])
             correct_val = float(correct_nums[-1])
 
-            # 数値の近似比較
-            return abs(gen_val - correct_val) < 1e-6
+            # 数値の近似比較（相対誤差も考慮）
+            if correct_val == 0:
+                return abs(gen_val) < 1e-6
+            else:
+                relative_error = abs(gen_val - correct_val) / abs(correct_val)
+                absolute_error = abs(gen_val - correct_val)
+                return relative_error < 1e-6 or absolute_error < 1e-6
 
-        except:
-            # 文字列の完全一致にフォールバック
-            return generated_answer.strip().lower() == correct_answer.strip().lower()
+        except Exception as e:
+            # 数値変換に失敗した場合、文字列の完全一致にフォールバック
+            try:
+                # 正規化された文字列比較
+                gen_clean = re.sub(
+                    r'\s+', ' ', generated_answer.strip().lower())
+                correct_clean = re.sub(
+                    r'\s+', ' ', correct_answer.strip().lower())
+                return gen_clean == correct_clean
+            except:
+                return False
 
     def evaluate_code_execution(self, generated_code: str, sample: Dict) -> bool:
         """
