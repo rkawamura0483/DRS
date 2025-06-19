@@ -313,22 +313,29 @@ class BenchmarkRunner:
         elif sample["type"] == "code":
             # コード問題: 関数定義を抽出
             if sample["dataset"] == "humaneval":
-                # def で始まる行から次のdef または文末まで
+                # def で始まる行から関数の終わりまでをインデントに基づいて抽出
                 lines = generated_text.split('\n')
                 code_lines = []
                 in_function = False
+                start_indent = 0
 
                 for line in lines:
-                    if line.strip().startswith('def '):
-                        in_function = True
-                        code_lines.append(line)
+                    stripped_line = line.strip()
+                    if stripped_line.startswith('def '):
+                        if not in_function:
+                            in_function = True
+                            # 関数の最初の行のインデントを記録
+                            start_indent = len(line) - len(line.lstrip())
+                            code_lines.append(line)
+                        elif in_function:
+                            # 別の関数定義が始まったら終了
+                            break
                     elif in_function:
-                        if line.strip().startswith('def ') and len(code_lines) > 1:
+                        # インデントが関数定義と同じかそれより小さい、空でない行が見つかったら終了
+                        current_indent = len(line) - len(line.lstrip())
+                        if stripped_line and current_indent <= start_indent:
                             break
                         code_lines.append(line)
-                        if line.strip() == '' and len(code_lines) > 5:
-                            # 空行で関数終了の可能性
-                            break
 
                 return '\n'.join(code_lines)
 
