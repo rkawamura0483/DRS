@@ -180,14 +180,16 @@ class AdaptiveSchedulingTester:
                         'HIGH_EFFICIENCY' else 0 for mode in mode_history]
 
         # モード切り替えを色分けして表示
+        added_labels = set()  # 追加済みラベルを追跡
+
         for i in range(len(mode_numeric)):
             color = 'lightgreen' if mode_numeric[i] == 1 else 'lightcoral'
             label = 'High-Efficiency' if mode_numeric[i] == 1 else 'High-Quality'
 
             # 最初の出現時のみラベルを付ける
-            if i == 0 or (i > 0 and mode_numeric[i] != mode_numeric[i-1]):
-                plt.bar(i, 1, color=color, alpha=0.7, label=label if i == 0 or label not in [
-                        item.get_label() for item in plt.gca().get_legend_handles_labels()[1]] else "")
+            if label not in added_labels:
+                plt.bar(i, 1, color=color, alpha=0.7, label=label)
+                added_labels.add(label)
             else:
                 plt.bar(i, 1, color=color, alpha=0.7)
 
@@ -195,11 +197,7 @@ class AdaptiveSchedulingTester:
         plt.xlabel('Generation Step', fontsize=12)
         plt.title('Mode Switching Pattern', fontsize=14, fontweight='bold')
         plt.yticks([0, 1], ['High-Quality', 'High-Efficiency'])
-
-        # 重複ラベルを避ける
-        handles, labels = plt.gca().get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        plt.legend(by_label.values(), by_label.keys())
+        plt.legend()
 
         plt.grid(True, alpha=0.3, axis='x')
 
