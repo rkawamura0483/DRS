@@ -21,7 +21,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from tqdm import tqdm
 import time
 
-from adaptive_scheduler import AdaptiveInferenceScheduler
+from adaptive_scheduler import AdaptiveInferenceScheduler, InferenceMode
 from cache_manager import TieredCacheManager, CacheTier
 
 # 必要な関数をimport
@@ -107,9 +107,7 @@ def generate_with_adaptive_scheduling(
     model,
     prompt: torch.Tensor,
     gen_length: int = 128,
-    base_block_size: int = 16,
-    base_confidence_threshold: float = 0.8,
-    adaptation_rate: float = 0.2,
+    # base_block_size と base_confidence_threshold は不要になる
     enable_tiered_cache: bool = True,
     temperature: float = 0.0,
     remasking: str = 'low_confidence',
@@ -121,16 +119,12 @@ def generate_with_adaptive_scheduling(
     """
     Self-Correcting Adaptive Inference Scheduling for Diffusion LLMs
 
-    アダプティブスケジューリングを使用した生成関数。動的ブロックサイズ調整、
-    適応的信頼度閾値、階層キャッシュ管理を統合。
+    モード切り替え式スケジューリングを使用した生成関数。
 
     Args:
         model: LLaDAモデル
         prompt: 入力プロンプト (1, prompt_length)
         gen_length: 生成する長さ
-        base_block_size: 初期ブロックサイズ
-        base_confidence_threshold: 初期信頼度閾値
-        adaptation_rate: 適応率
         enable_tiered_cache: 階層キャッシュを有効にするか
         temperature: サンプリング温度
         remasking: リマスキング戦略
@@ -156,38 +150,22 @@ def generate_with_adaptive_scheduling(
         else:
             mask_id = 126336  # LLaDAのデフォルトマスクトークンID
 
-    if verbose:
-        print(f"\n🚀 Adaptive Scheduling 開始")
-        print(f"   プロンプト長: {prompt.shape[1]}")
-        print(f"   生成長: {gen_length}")
-        print(f"   初期ブロックサイズ: {base_block_size}")
-        print(f"   初期信頼度閾値: {base_confidence_threshold}")
-        print(f"   マスクトークンID: {mask_id}")
-        print(f"   階層キャッシュ: {enable_tiered_cache}")
+    # スケジューラーの初期化（モードベース）
+    scheduler = AdaptiveInferenceScheduler(**scheduler_config)
 
-    # スケジューラーの初期化
-    scheduler = AdaptiveInferenceScheduler(
-        min_block_size=max(4, base_block_size // 2),
-        max_block_size=min(64, base_block_size * 3),
-        base_confidence_threshold=base_confidence_threshold,
-        adaptation_sensitivity=0.05,  # より保守的な値に変更（0.2→0.05）
-        entropy_threshold_high=1.2,   # より適切な値に調整（0.8→1.2）
-        entropy_threshold_low=0.4,    # より適切な値に調整（0.3→0.4）
-        scale_up_factor=1.4,          # より控えめに調整（1.6→1.4）
-        scale_down_factor=0.7,        # より控えめに調整（0.5→0.7）
-        **scheduler_config
-    )
-
-    # 初期ブロックサイズを明示的に設定
-    scheduler.current_block_size = base_block_size
-
-    # 初期ブロックサイズを設定（スケジューラーの内部状態に従う）
+    # 初期値はスケジューラーから取得
     current_block_size = scheduler.current_block_size
     current_threshold = scheduler.current_threshold
 
     if verbose:
-        print(
-            f"🎯 初期設定: ブロックサイズ={current_block_size}, 閾値={current_threshold:.3f}")
+        print(f"\n🚀 Adaptive Mode-Switching Scheduling 開始")
+        print(f"   プロンプト長: {prompt.shape[1]}")
+        print(f"   生成長: {gen_length}")
+        print(f"   初期モード: {scheduler.current_mode.value}")
+        print(f"   初期ブロックサイズ: {current_block_size}")
+        print(f"   初期信頼度閾値: {current_threshold}")
+        print(f"   マスクトークンID: {mask_id}")
+        print(f"   階層キャッシュ: {enable_tiered_cache}")
 
     # キャッシュマネージャーの初期化
     cache_manager = None
@@ -207,6 +185,7 @@ def generate_with_adaptive_scheduling(
         'threshold_history': [],
         'confidence_history': [],
         'entropy_history': [],
+        'mode_history': [],  # モード履歴を追加
         'cache_efficiency': {},
         'timing': {
             'total_time': 0,
@@ -247,7 +226,8 @@ def generate_with_adaptive_scheduling(
 
             if verbose:
                 print(
-                    f"\n📦 ブロック {block_id}: 意図サイズ={current_block_size}, 実際サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
+                    f"\n📦 ブロック {block_id}: モード={scheduler.current_mode.value}, "
+                    f"意図サイズ={current_block_size}, 実際サイズ={actual_block_size}, 閾値={current_threshold:.3f}")
 
             # ブロック生成 - 完全な反復的生成を実行
             block_generated, block_metrics = _generate_block_adaptive_complete(
@@ -275,79 +255,50 @@ def generate_with_adaptive_scheduling(
                         block_metrics['confidence_scores']) > 0 else 0.0
                     print(f"   平均信頼度: {avg_conf:.3f}")
 
-            # アダプティブ調整
-            if (block_metrics['confidence_scores'] is not None and
-                block_metrics['final_logits'] is not None and
-                    block_metrics['final_mask_index'] is not None):
+            # 適応的調整（モード切り替え）
+            if block_metrics['confidence_scores'] is not None:
                 adaptation_start = time.time()
 
-                # ブロック生成関数からの信頼度を直接使用（より正確）
                 block_confidence = block_metrics['confidence_scores'].mean().item() if len(
                     block_metrics['confidence_scores']) > 0 else 0.0
 
-                # エントロピー計算のため、スケジューラーの計算を呼び出す
-                _, entropy = scheduler.calculate_confidence_metrics(
-                    block_metrics['final_logits'],
-                    x[:, block_start:block_end],
-                    block_metrics['final_mask_index']
-                )
+                # 適応を実行
+                mode_changed = scheduler.adapt_mode(block_confidence)
 
-                # 適応を実行（信頼度は直接渡す）
-                old_block_size = scheduler.current_block_size
-                old_threshold = scheduler.current_threshold
+                # 適応後の値を取得
+                current_block_size = scheduler.current_block_size
+                current_threshold = scheduler.current_threshold
 
-                # ブロックサイズ適応
-                next_block_size = scheduler.adapt_block_size(block_confidence)
-
-                # 閾値適応
-                adapted_threshold = scheduler.adapt_threshold(entropy)
-
-                # 適応カウント
-                if (next_block_size != old_block_size or
-                        abs(adapted_threshold - old_threshold) > 0.01):
-                    scheduler.adaptation_count += 1
+                if mode_changed:
                     metrics['total_adaptations'] += 1
                     if verbose:
-                        print(f"🔄 適応: ブロックサイズ {current_block_size}→{next_block_size}, "
-                              f"閾値 {current_threshold:.3f}→{adapted_threshold:.3f}")
-
-                # ステップメトリクス
-                step_metrics = {
-                    'confidence': block_confidence,
-                    'entropy': entropy,
-                    'block_size': next_block_size,
-                    'threshold': adapted_threshold,
-                    'adapted': (next_block_size != old_block_size or
-                                abs(adapted_threshold - old_threshold) > 0.001)
-                }
-
-                # スケジューラーからの適応結果を使用
-                current_block_size = next_block_size
-                current_threshold = adapted_threshold
+                        print(f"🔄 モード変更: 新モード={scheduler.current_mode.value}, "
+                              f"ブロックサイズ→{current_block_size}, "
+                              f"閾値→{current_threshold:.3f}")
 
                 # メトリクス記録
-                metrics['block_size_history'].append(next_block_size)
-                metrics['threshold_history'].append(adapted_threshold)
-                metrics['confidence_history'].append(
-                    step_metrics['confidence'])
-                metrics['entropy_history'].append(step_metrics['entropy'])
-
-                if verbose:
-                    print(f"📊 記録: 意図サイズ={next_block_size}, 実際サイズ={actual_block_size}, "
-                          f"信頼度={step_metrics['confidence']:.3f}, エントロピー={step_metrics['entropy']:.3f}")
+                metrics['block_size_history'].append(current_block_size)
+                metrics['threshold_history'].append(current_threshold)
+                metrics['confidence_history'].append(block_confidence)
+                # エントロピーも計算して記録する場合（オプション）
+                entropy = scheduler.calculate_entropy(
+                    block_metrics['final_logits'],
+                    block_metrics['final_mask_index']
+                ) if block_metrics['final_logits'] is not None else 0.0
+                metrics['entropy_history'].append(entropy)
+                metrics['mode_history'].append(scheduler.current_mode.name)
 
                 metrics['timing']['adaptation_time'] += time.time() - \
                     adaptation_start
             else:
                 # 信頼度スコアがない場合のフォールバック
                 if verbose:
-                    print(f"⚠️  ブロック {block_id}: 適応データ不足、適応をスキップ")
-                # デフォルト値で記録（現在のブロックサイズを使用）
-                # actual_block_size -> current_block_size
+                    print(f"⚠️  ブロック {block_id}: 適応データ不足、モード変更なし")
                 metrics['block_size_history'].append(current_block_size)
                 metrics['threshold_history'].append(current_threshold)
                 metrics['confidence_history'].append(0.0)
                 metrics['entropy_history'].append(0.0)
+                metrics['mode_history'].append(scheduler.current_mode.name)
 
             # キャッシュ使用状況の記録
             if enable_tiered_cache and block_metrics['cache_tier']:
@@ -380,7 +331,7 @@ def generate_with_adaptive_scheduling(
     # スケジューラーメトリクス
     scheduler_metrics = scheduler.get_adaptation_metrics()
     metrics.update({
-        'avg_block_size': np.mean(metrics['block_size_history']) if metrics['block_size_history'] else base_block_size,
+        'avg_block_size': np.mean(metrics['block_size_history']) if metrics['block_size_history'] else 0,
         'final_threshold': scheduler_metrics['current_threshold'],
         'adaptation_rate': scheduler_metrics['adaptation_count'] / max(1, scheduler_metrics['total_blocks'])
     })
@@ -395,10 +346,11 @@ def generate_with_adaptive_scheduling(
 
     # 最終レポート
     if verbose:
-        print(f"\n🎉 Adaptive Scheduling 完了!")
+        print(f"\n🎉 Adaptive Mode-Switching Scheduling 完了!")
         print(f"   総時間: {metrics['timing']['total_time']:.2f}秒")
         print(f"   総NFE: {metrics['nfe']}")
-        print(f"   適応回数: {metrics['total_adaptations']}")
+        print(f"   モード変更回数: {metrics['total_adaptations']}")
+        print(f"   最終モード: {scheduler.current_mode.value}")
         print(f"   平均ブロックサイズ: {np.mean(metrics['block_size_history']):.1f}")
         print(f"   最終信頼度閾値: {metrics['final_threshold']:.3f}")
         if enable_tiered_cache:
