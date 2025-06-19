@@ -89,6 +89,8 @@ class BenchmarkRunner:
         print(f"📚 Loading datasets... ({samples_per_dataset} samples each)")
 
         datasets = {}
+        # 再現性のため、同じランダムサンプルを選択するためのシード
+        seed = 42
 
         # GSM8K
         print("   Loading GSM8K...")
@@ -102,7 +104,7 @@ class BenchmarkRunner:
                     "answer": item["answer"],
                     "type": "math"
                 }
-                for i, item in enumerate(gsm8k.select(range(min(samples_per_dataset, len(gsm8k)))))
+                for i, item in enumerate(gsm8k.shuffle(seed=seed).select(range(min(samples_per_dataset, len(gsm8k)))))
             ]
             print(f"     ✅ GSM8K: {len(datasets['gsm8k'])} samples")
         except Exception as e:
@@ -146,7 +148,7 @@ class BenchmarkRunner:
                         "answer": item.get("solution", item.get("answer", "")),
                         "type": "math"
                     }
-                    for i, item in enumerate(math_dataset.select(range(min(samples_per_dataset, len(math_dataset)))))
+                    for i, item in enumerate(math_dataset.shuffle(seed=seed).select(range(min(samples_per_dataset, len(math_dataset)))))
                 ]
                 print(f"     ✅ MATH: {len(datasets['math'])} samples")
             else:
@@ -171,7 +173,7 @@ class BenchmarkRunner:
                     "entry_point": item["entry_point"],
                     "type": "code"
                 }
-                for i, item in enumerate(humaneval.select(range(min(samples_per_dataset, len(humaneval)))))
+                for i, item in enumerate(humaneval.shuffle(seed=seed).select(range(min(samples_per_dataset, len(humaneval)))))
             ]
             print(f"     ✅ HumanEval: {len(datasets['humaneval'])} samples")
         except Exception as e:
@@ -210,7 +212,7 @@ class BenchmarkRunner:
                 print(f"     🔍 利用可能フィールド: {available_fields}")
 
                 datasets["mbpp"] = []
-                for i, item in enumerate(mbpp_dataset.select(range(min(samples_per_dataset, len(mbpp_dataset))))):
+                for i, item in enumerate(mbpp_dataset.shuffle(seed=seed).select(range(min(samples_per_dataset, len(mbpp_dataset))))):
                     # Adapt to different field names
                     text_field = item.get("text", item.get(
                         "prompt", item.get("description", "")))
