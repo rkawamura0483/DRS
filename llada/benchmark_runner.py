@@ -64,17 +64,17 @@ class BenchmarkRunner:
         self.device = device if device != "auto" else (
             "cuda" if torch.cuda.is_available() else "cpu")
 
-        print(f"🔧 BenchmarkRunner初期化")
-        print(f"   モデル: {model_name}")
-        print(f"   デバイス: {self.device}")
+        print(f"🔧 BenchmarkRunner initialization")
+        print(f"   Model: {model_name}")
+        print(f"   Device: {self.device}")
 
-        # モデルとトークナイザーの読み込み
-        print("📦 モデル読み込み中...")
+        # Load model and tokenizer
+        print("📦 Loading model...")
         self.model = LLaDAModelLM.from_pretrained(model_name).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model.eval()
 
-        print("✅ 初期化完了")
+        print("✅ Initialization complete")
 
     def load_datasets(self, samples_per_dataset: int = 25) -> Dict[str, List[Dict]]:
         """
@@ -86,12 +86,12 @@ class BenchmarkRunner:
         Returns:
             データセット辞書
         """
-        print(f"📚 データセット読み込み中... (各{samples_per_dataset}サンプル)")
+        print(f"📚 Loading datasets... ({samples_per_dataset} samples each)")
 
         datasets = {}
 
         # GSM8K
-        print("   GSM8K読み込み中...")
+        print("   Loading GSM8K...")
         try:
             gsm8k = load_dataset("gsm8k", "main", split="test")
             datasets["gsm8k"] = [
@@ -104,13 +104,13 @@ class BenchmarkRunner:
                 }
                 for i, item in enumerate(gsm8k.select(range(min(samples_per_dataset, len(gsm8k)))))
             ]
-            print(f"     ✅ GSM8K: {len(datasets['gsm8k'])}サンプル")
+            print(f"     ✅ GSM8K: {len(datasets['gsm8k'])} samples")
         except Exception as e:
-            print(f"     ❌ GSM8K読み込みエラー: {e}")
+            print(f"     ❌ GSM8K loading error: {e}")
             datasets["gsm8k"] = []
 
-        # MATH データセット
-        print("   MATH読み込み中...")
+        # MATH dataset
+        print("   Loading MATH...")
         try:
             # 複数の代替データセットを試行
             alternative_datasets = [
@@ -148,16 +148,16 @@ class BenchmarkRunner:
                     }
                     for i, item in enumerate(math_dataset.select(range(min(samples_per_dataset, len(math_dataset)))))
                 ]
-                print(f"     ✅ MATH: {len(datasets['math'])}サンプル")
+                print(f"     ✅ MATH: {len(datasets['math'])} samples")
             else:
-                print(f"     ❌ MATH: 利用可能なデータセットがありません")
+                print(f"     ❌ MATH: No available dataset")
                 datasets["math"] = []
         except Exception as e:
-            print(f"     ❌ MATH読み込みエラー: {e}")
+            print(f"     ❌ MATH loading error: {e}")
             datasets["math"] = []
 
         # HumanEval
-        print("   HumanEval読み込み中...")
+        print("   Loading HumanEval...")
         try:
             humaneval = load_dataset("openai_humaneval", split="test")
             datasets["humaneval"] = [
@@ -173,58 +173,103 @@ class BenchmarkRunner:
                 }
                 for i, item in enumerate(humaneval.select(range(min(samples_per_dataset, len(humaneval)))))
             ]
-            print(f"     ✅ HumanEval: {len(datasets['humaneval'])}サンプル")
+            print(f"     ✅ HumanEval: {len(datasets['humaneval'])} samples")
         except Exception as e:
-            print(f"     ❌ HumanEval読み込みエラー: {e}")
+            print(f"     ❌ HumanEval loading error: {e}")
             datasets["humaneval"] = []
 
         # MBPP
-        print("   MBPP読み込み中...")
+        print("   Loading MBPP...")
         try:
-            mbpp = load_dataset("mbpp", "sanitized", split="test")
-            datasets["mbpp"] = [
-                {
-                    "dataset": "mbpp",
-                    "id": i,
-                    "task_id": item["task_id"],
-                    "text": item["text"],
-                    "code": item["code"],
-                    "test_list": item["test_list"],
-                    "type": "code"
-                }
-                for i, item in enumerate(mbpp.select(range(min(samples_per_dataset, len(mbpp)))))
+            # Try different MBPP dataset configurations
+            mbpp_configs = [
+                ("mbpp", "sanitized", "test"),
+                ("mbpp", None, "test"),
+                ("google/mbpp", None, "test")
             ]
-            print(f"     ✅ MBPP: {len(datasets['mbpp'])}サンプル")
+
+            mbpp_dataset = None
+            for config in mbpp_configs:
+                try:
+                    dataset_name, subset, split = config
+                    if subset:
+                        mbpp_dataset = load_dataset(
+                            dataset_name, subset, split=split)
+                    else:
+                        mbpp_dataset = load_dataset(dataset_name, split=split)
+                    print(f"     📊 使用データセット: {dataset_name}")
+                    break
+                except Exception as sub_e:
+                    print(f"     ⚠️  {dataset_name} 失敗: {sub_e}")
+                    continue
+
+            if mbpp_dataset is not None:
+                # Check what fields are available and adapt accordingly
+                sample_item = mbpp_dataset[0]
+                available_fields = list(sample_item.keys())
+                print(f"     🔍 利用可能フィールド: {available_fields}")
+
+                datasets["mbpp"] = []
+                for i, item in enumerate(mbpp_dataset.select(range(min(samples_per_dataset, len(mbpp_dataset))))):
+                    # Adapt to different field names
+                    text_field = item.get("text", item.get(
+                        "prompt", item.get("description", "")))
+                    code_field = item.get("code", item.get(
+                        "solution", item.get("canonical_solution", "")))
+                    test_field = item.get("test_list", item.get(
+                        "tests", item.get("test", [])))
+                    task_id_field = item.get("task_id", item.get("id", i))
+
+                    # Ensure test_field is a list
+                    if isinstance(test_field, str):
+                        test_field = [test_field]
+                    elif test_field is None:
+                        test_field = []
+
+                    datasets["mbpp"].append({
+                        "dataset": "mbpp",
+                        "id": i,
+                        "task_id": task_id_field,
+                        "text": text_field,
+                        "code": code_field,
+                        "test_list": test_field,
+                        "type": "code"
+                    })
+
+                print(f"     ✅ MBPP: {len(datasets['mbpp'])} samples")
+            else:
+                print(f"     ❌ MBPP: No available dataset")
+                datasets["mbpp"] = []
         except Exception as e:
-            print(f"     ❌ MBPP読み込みエラー: {e}")
+            print(f"     ❌ MBPP loading error: {e}")
             datasets["mbpp"] = []
 
         total_samples = sum(len(dataset) for dataset in datasets.values())
-        print(f"📊 合計: {total_samples}サンプル読み込み完了")
+        print(f"📊 Total: {total_samples} samples loaded")
 
         return datasets
 
     def format_prompt(self, sample: Dict) -> str:
         """
-        サンプルに応じてプロンプトをフォーマット
+        Format prompts according to sample type
 
         Args:
-            sample: データサンプル
+            sample: Data sample
 
         Returns:
-            フォーマット済みプロンプト
+            Formatted prompt
         """
         if sample["dataset"] == "gsm8k":
-            return f"問題を段階的に解いてください:\n\n{sample['question']}\n\n答え:"
+            return f"Solve this problem step by step:\n\n{sample['question']}\n\nAnswer:"
 
         elif sample["dataset"] == "math":
-            return f"以下の数学問題を解いてください:\n\n{sample['question']}\n\n解答:"
+            return f"Solve the following math problem:\n\n{sample['question']}\n\nSolution:"
 
         elif sample["dataset"] == "humaneval":
             return f"{sample['prompt']}"
 
         elif sample["dataset"] == "mbpp":
-            return f"以下の問題に対するPython関数を書いてください:\n\n{sample['text']}\n\n```python\n"
+            return f"Write a Python function for the following problem:\n\n{sample['text']}\n\n```python\n"
 
         else:
             return sample.get("question", sample.get("prompt", ""))
