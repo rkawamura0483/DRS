@@ -13,6 +13,7 @@ import sys
 import os
 import glob
 import subprocess
+import importlib.util
 
 # Fast-dLLMのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -56,43 +57,132 @@ if not os.path.exists(os.path.join(current_dir, 'Fast-dLLM')) or not os.path.exi
     print("🔄 必要なリポジトリが見つかりません。自動セットアップを開始...")
     auto_clone_repositories()
 
-# modeling_llada.pyファイルを探す
-print("\n🔍 modeling_llada.py を検索中...")
-model_path = None
-generate_path = None
+# Fast-dLLMの実装を安全に読み込む
+print("\n🔍 Fast-dLLM実装を検索中...")
+LLaDAModelLM = None
+generate = None
+generate_with_prefix_cache = None
+generate_with_dual_cache = None
 
-for root, dirs, files in os.walk(current_dir):
-    if 'modeling_llada.py' in files:
-        print(f"✅ 見つかりました: {root}")
-        model_path = root
-        generate_path = os.path.dirname(
-            root) if root.endswith('model') else root
+# 複数のパスを試行
+fast_dllm_paths = [
+    os.path.join(current_dir, 'Fast-dLLM', 'llada'),
+    os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model'),
+    './Fast-dLLM/llada',
+    './Fast-dLLM/llada/model',
+    'Fast-dLLM/llada',
+    'Fast-dLLM/llada/model'
+]
+
+for path in fast_dllm_paths:
+    if os.path.exists(path):
+        print(f"✅ Fast-dLLMパスを発見: {path}")
+        sys.path.insert(0, path)
+
+        # モデルディレクトリも追加
+        model_path = os.path.join(
+            path, 'model') if not path.endswith('model') else path
+        if os.path.exists(model_path):
+            sys.path.insert(0, model_path)
+            print(f"✅ モデルパスを追加: {model_path}")
         break
-else:
-    # フォールバック: 標準的なパス
-    print("🔍 標準パスを使用...")
-    model_path = os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model')
-    generate_path = os.path.join(current_dir, 'Fast-dLLM', 'llada')
 
-print(f"📍 使用するパス:")
-print(f"  - モデルパス: {model_path}")
-print(f"  - 生成パス: {generate_path}")
-
-sys.path.insert(0, model_path)
-sys.path.insert(0, generate_path)
-
+# インポートを安全に実行
 try:
-    from modeling_llada import LLaDAModelLM
-    from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
-    print("✅ Fast-dLLMの正しい実装を読み込みました")
-except ImportError as e:
-    print(f"⚠️  Fast-dLLMの実装が見つかりません: {e}")
-    # フォールバック: Hugging Face Hub のAutoModelForCausalLMを使用
-    print("⚠️  AutoModelForCausalLMを使用します（キャッシュ機能制限あり）")
+    # まず相対インポートの問題を回避するため、必要なモジュールを個別に処理
+
+    # modeling_llada.pyの直接読み込み
+    model_file_paths = [
+        os.path.join(current_dir, 'Fast-dLLM', 'llada',
+                     'model', 'modeling_llada.py'),
+        './Fast-dLLM/llada/model/modeling_llada.py',
+        'Fast-dLLM/llada/model/modeling_llada.py'
+    ]
+
+    for model_file in model_file_paths:
+        if os.path.exists(model_file):
+            print(f"📂 modeling_llada.py を発見: {model_file}")
+
+            # configuration_llada.pyも同時に読み込み
+            config_file = os.path.join(os.path.dirname(
+                model_file), 'configuration_llada.py')
+            if os.path.exists(config_file):
+                print(f"📂 configuration_llada.py を発見: {config_file}")
+
+                # 設定モジュールを先に読み込み
+                spec_config = importlib.util.spec_from_file_location(
+                    "configuration_llada", config_file)
+                config_module = importlib.util.module_from_spec(spec_config)
+                sys.modules["configuration_llada"] = config_module
+                spec_config.loader.exec_module(config_module)
+
+                # モデルモジュールを読み込み
+                spec_model = importlib.util.spec_from_file_location(
+                    "modeling_llada", model_file)
+                model_module = importlib.util.module_from_spec(spec_model)
+
+                # 相対インポートを解決するために設定モジュールを注入
+                model_module.configuration_llada = config_module
+
+                sys.modules["modeling_llada"] = model_module
+                spec_model.loader.exec_module(model_module)
+
+                LLaDAModelLM = model_module.LLaDAModelLM
+                print("✅ LLaDAModelLM を正常に読み込みました")
+                break
+
+    # generate.pyの読み込み
+    generate_file_paths = [
+        os.path.join(current_dir, 'Fast-dLLM', 'llada', 'generate.py'),
+        './Fast-dLLM/llada/generate.py',
+        'Fast-dLLM/llada/generate.py'
+    ]
+
+    for generate_file in generate_file_paths:
+        if os.path.exists(generate_file):
+            print(f"📂 generate.py を発見: {generate_file}")
+
+            spec_generate = importlib.util.spec_from_file_location(
+                "generate", generate_file)
+            generate_module = importlib.util.module_from_spec(spec_generate)
+
+            # modeling_lladaモジュールを注入
+            if LLaDAModelLM is not None:
+                generate_module.LLaDAModelLM = LLaDAModelLM
+
+            sys.modules["generate"] = generate_module
+            spec_generate.loader.exec_module(generate_module)
+
+            generate = generate_module.generate
+            generate_with_prefix_cache = generate_module.generate_with_prefix_cache
+            generate_with_dual_cache = generate_module.generate_with_dual_cache
+
+            print("✅ Fast-dLLMの生成関数を正常に読み込みました")
+            print(f"  - generate: {generate is not None}")
+            print(
+                f"  - generate_with_prefix_cache: {generate_with_prefix_cache is not None}")
+            print(
+                f"  - generate_with_dual_cache: {generate_with_dual_cache is not None}")
+            break
+
+except Exception as e:
+    print(f"⚠️ Fast-dLLM実装の読み込みに失敗: {e}")
+    print("フォールバック: Hugging Face Transformersを使用します")
+
+# フォールバック設定
+if LLaDAModelLM is None:
+    print("⚠️ AutoModelForCausalLMを使用します（キャッシュ機能制限あり）")
+    from transformers import AutoModelForCausalLM
     LLaDAModelLM = AutoModelForCausalLM
-    generate = None
-    generate_with_prefix_cache = None
-    generate_with_dual_cache = None
+
+print(f"\n📋 最終的な実装状況:")
+print(
+    f"  - LLaDAModelLM: {'✅ Fast-dLLM' if LLaDAModelLM.__name__ == 'LLaDAModelLM' else '⚠️ Transformers AutoModel'}")
+print(f"  - generate: {'✅' if generate is not None else '❌'}")
+print(
+    f"  - generate_with_prefix_cache: {'✅' if generate_with_prefix_cache is not None else '❌'}")
+print(
+    f"  - generate_with_dual_cache: {'✅' if generate_with_dual_cache is not None else '❌'}")
 
 
 def add_gumbel_noise(logits, temperature):
@@ -520,20 +610,43 @@ def load_model_with_scaling(model_path, scaling_factor=1, device='auto'):
         config.rope_theta = original_theta * scaling_factor
         print(f"🔧 RoPE θ: {original_theta} → {config.rope_theta}")
 
-    # LLaDAモデル読み込み（Fast-dLLMの正しいクラス使用 または フォールバック）
-    model = LLaDAModelLM.from_pretrained(
-        model_path,
-        config=config,
-        torch_dtype=torch.float16,
-        device_map=device,
-        trust_remote_code=True
-    )
-
-    # トークナイザ読み込み
+    # トークナイザ読み込み（モデル読み込み前に実行）
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, trust_remote_code=True)
 
+    # LLaDAモデル読み込み（Fast-dLLMの正しいクラス使用 または フォールバック）
+    print(f"🔧 使用するモデルクラス: {LLaDAModelLM.__name__}")
+
+    try:
+        model = LLaDAModelLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map=device,
+            trust_remote_code=True
+        )
+        print("✅ モデル読み込み成功")
+    except Exception as e:
+        print(f"⚠️ モデル読み込みエラー: {e}")
+        print("🔄 フォールバック: AutoModelForCausalLMで再試行...")
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.float16,
+            device_map=device,
+            trust_remote_code=True
+        )
+        print("✅ フォールバックモデル読み込み成功")
+
     model.eval()
+
+    # メモリ使用量表示
+    memory_info = get_memory_usage()
+    if memory_info:
+        print(
+            f"💾 読み込み後メモリ: {memory_info['allocated']:.1f}GB / {memory_info['total']:.1f}GB")
+
     return model, tokenizer, config
 
 

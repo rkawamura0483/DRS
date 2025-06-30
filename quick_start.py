@@ -288,11 +288,11 @@ def demo_speed_comparison(prev_model=None, prev_tokenizer=None):
         formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
     configs = [
-        {"name": "🏃 超高速", "steps": 32, "block_length": 64, "remasking": "random"},
+        {"name": "🏃 超高速", "steps": 32, "block_length": 32, "remasking": "random"},
         {"name": "⚡ 高速", "steps": 64, "block_length": 32, "remasking": "random"},
         {"name": "🎯 標準", "steps": 64, "block_length": 32,
             "remasking": "low_confidence"},
-        {"name": "🎨 品質重視", "steps": 128, "block_length": 16,
+        {"name": "🎨 品質重視", "steps": 128, "block_length": 32,
             "remasking": "low_confidence"}
     ]
 
