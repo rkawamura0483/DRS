@@ -273,7 +273,7 @@ def generate_with_gts_controlled_sampling(
                 trajectory_recorder.record_step(
                     block_logits,
                     step_idx,
-                    block_mask,
+                    None,  # マスクを軌跡記録時には適用せず、後でGTS計算時に適用
                     metadata={'iteration': iteration, 'nfe': iteration_nfe}
                 )
 
@@ -313,8 +313,7 @@ def generate_with_gts_controlled_sampling(
                     for step, step_logits in enumerate(logits_sequence):
                         # step_logits shape: (1, parallel_k, vocab_size)
                         # マスクされたトークンのみを評価
-                        current_mask = (
-                            x[:, block_start:block_end] == mask_id) if iteration == 0 else None
+                        current_mask = (x[:, block_start:block_end] == mask_id)
                         gts_metric.update(step_logits, step, current_mask)
 
                     gts_score = gts_metric.value()
