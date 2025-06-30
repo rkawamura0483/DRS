@@ -27,7 +27,7 @@ from integrated_generation import generate_fast_long, load_model_with_scaling
 class LLMJudge:
     """LLM-as-a-Judge 評価クラス"""
 
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash"):
         """
         Args:
             api_key: Google API キー（環境変数 GOOGLE_API_KEY からも取得可能）
@@ -330,7 +330,7 @@ def main():
     parser = argparse.ArgumentParser(description='LLM-as-a-Judge 評価')
     parser.add_argument('--api-key', help='Google API キー')
     parser.add_argument(
-        '--model', default='gemini-2.0-flash-exp', help='Judgeモデル')
+        '--model', default='gemini-2.0-flash', help='Judgeモデル')
 
     args = parser.parse_args()
 
