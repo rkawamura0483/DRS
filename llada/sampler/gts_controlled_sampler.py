@@ -34,16 +34,29 @@ from typing import List, Tuple, Optional, Dict, Any
 import time
 from tqdm import tqdm
 
-# llada内部モジュールのimport
-from ..metrics.gts import BasicGTS, create_gts_metric, evaluate_trajectory_stability
-from ..utils.trajectory_recorder import TrajectoryRecorder
-
-# 既存のキャッシュマネージャーがあれば使用
+# llada内部モジュールのimport - 相対インポートと絶対インポートの両方に対応
 try:
-    from ..cache_manager import TieredCacheManager
-    CACHE_AVAILABLE = True
-except ImportError:
-    CACHE_AVAILABLE = False
+    # 相対インポート（パッケージとして実行される場合）
+    from ..metrics.gts import BasicGTS, create_gts_metric, evaluate_trajectory_stability
+    from ..utils.trajectory_recorder import TrajectoryRecorder
+    try:
+        from ..cache_manager import TieredCacheManager
+        CACHE_AVAILABLE = True
+    except ImportError:
+        CACHE_AVAILABLE = False
+except (ImportError, ValueError):
+    # 絶対インポート（直接実行される場合）
+    import sys
+    import os
+    sys.path.append(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    from metrics.gts import BasicGTS, create_gts_metric, evaluate_trajectory_stability
+    from utils.trajectory_recorder import TrajectoryRecorder
+    try:
+        from cache_manager import TieredCacheManager
+        CACHE_AVAILABLE = True
+    except ImportError:
+        CACHE_AVAILABLE = False
 
 
 def add_gumbel_noise(logits, temperature):

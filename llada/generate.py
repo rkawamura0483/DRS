@@ -37,7 +37,16 @@ try:
     from sampler.gts_controlled_sampler import generate_with_gts_controlled_sampling
     GTS_SAMPLING_AVAILABLE = True
 except ImportError:
-    GTS_SAMPLING_AVAILABLE = False
+    try:
+        # 絶対インポート（lladadirectory内から実行される場合）
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from sampler.gts_controlled_sampler import generate_with_gts_controlled_sampling
+        GTS_SAMPLING_AVAILABLE = True
+    except ImportError as e:
+        print(f"🔧 デバッグ: GTSインポートエラー詳細: {e}")
+        GTS_SAMPLING_AVAILABLE = False
 
 
 def add_gumbel_noise(logits, temperature):

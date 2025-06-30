@@ -20,6 +20,13 @@ GTS制御サンプラーモジュール
 Generative Trajectory Stability (GTS) に基づく制御サンプリング手法を提供します。
 """
 
-from .gts_controlled_sampler import generate_with_gts_controlled_sampling
+try:
+    from .gts_controlled_sampler import generate_with_gts_controlled_sampling
+except (ImportError, ValueError):
+    # 直接実行される場合の絶対インポート
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from gts_controlled_sampler import generate_with_gts_controlled_sampling
 
 __all__ = ['generate_with_gts_controlled_sampling']
