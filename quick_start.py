@@ -10,16 +10,43 @@ from integrated_generation import (
     format_metrics,
     generate_fast_long_dual_cache,
     generate_fast_long_prefix_cache,
-    generate_no_cache
+    generate_no_cache,
+    safe_generate_with_fallback,
+    get_memory_usage,
+    optimize_parameters_for_memory
 )
 import torch
 import time
 import sys
 import os
+import gc
 
 # プロジェクトパスを追加
 sys.path.append('Fast-dLLM/llada')
 sys.path.append('LongLLaDA/llada')
+
+
+def cleanup_model(model=None, tokenizer=None):
+    """モデルとトークナイザを明示的に削除してメモリを解放"""
+    print("🧹 メモリクリーンアップ中...")
+
+    if model is not None:
+        del model
+    if tokenizer is not None:
+        del tokenizer
+
+    # Python ガベージコレクション
+    gc.collect()
+
+    # CUDA メモリクリア
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        memory_info = get_memory_usage()
+        if memory_info:
+            print(
+                f"💾 クリーンアップ後メモリ: {memory_info['allocated']:.1f}GB / {memory_info['total']:.1f}GB")
+
+    print("✅ メモリクリーンアップ完了")
 
 
 def check_environment():
@@ -105,10 +132,14 @@ def demo_basic_generation():
     return model, tokenizer
 
 
-def demo_long_context(model, tokenizer):
+def demo_long_context(prev_model=None, prev_tokenizer=None):
     """長文コンテキストデモ（修正版）"""
     print("\n📚 長文コンテキストデモ（RoPE スケーリング）")
     print("=" * 30)
+
+    # 前のモデルをクリーンアップしてメモリ解放
+    if prev_model is not None or prev_tokenizer is not None:
+        cleanup_model(prev_model, prev_tokenizer)
 
     # 長文読み込み（RoPEスケーリング適用）
     print("🔧 RoPE スケーリング適用...")
@@ -146,15 +177,13 @@ def demo_long_context(model, tokenizer):
     print(f"📏 長文入力長: {input_ids.shape[1]} トークン")
 
     if input_ids.shape[1] > 2000:  # 長文の場合
-        print("⚡ 長文生成中（RoPEスケーリング + デュアルキャッシュ）...")
-        outputs, nfe, metrics = generate_fast_long_dual_cache(
+        print("⚡ 長文生成中（RoPEスケーリング + 自動最適化）...")
+
+        # 自動メモリ最適化とフォールバック機能を使用
+        outputs, nfe, metrics = safe_generate_with_fallback(
             model=model_long,
             prompt=input_ids,
-            steps=32,       # 長文では更に少なめ
-            gen_length=256,
-            block_length=64,
             temperature=0.0,
-            remasking='low_confidence',
             scaling_factor=14
         )
 
@@ -166,14 +195,20 @@ def demo_long_context(model, tokenizer):
         print("-" * 40)
 
         format_metrics(metrics)
+        return model_long, tokenizer_long
     else:
         print("⚠️ コンテキストが短いため長文テストをスキップ")
+        return model_long, tokenizer_long
 
 
-def demo_cache_comparison():
+def demo_cache_comparison(prev_model=None, prev_tokenizer=None):
     """キャッシュ方式比較デモ"""
     print("\n💾 キャッシュ方式比較デモ")
     print("=" * 30)
+
+    # 前のモデルをクリーンアップ
+    if prev_model is not None or prev_tokenizer is not None:
+        cleanup_model(prev_model, prev_tokenizer)
 
     # モデル読み込み
     model, tokenizer, _ = load_model_with_scaling('GSAI-ML/LLaDA-8B-Instruct')
@@ -229,11 +264,17 @@ def demo_cache_comparison():
         print(f"  💾 キャッシュヒット: {metrics['cache_hits']}")
         print(f"  📝 結果: {result[:80]}...")
 
+    return model, tokenizer
 
-def demo_speed_comparison():
+
+def demo_speed_comparison(prev_model=None, prev_tokenizer=None):
     """速度比較デモ（修正版）"""
     print("\n⚡ 速度設定比較デモ")
     print("=" * 30)
+
+    # 前のモデルをクリーンアップ
+    if prev_model is not None or prev_tokenizer is not None:
+        cleanup_model(prev_model, prev_tokenizer)
 
     # モデル読み込み
     model, tokenizer, _ = load_model_with_scaling('GSAI-ML/LLaDA-8B-Instruct')
@@ -276,11 +317,17 @@ def demo_speed_comparison():
         print(f"  🔄 NFE: {metrics['nfe']}")
         print(f"  📝 結果: {result[:80]}...")
 
+    return model, tokenizer
 
-def demo_niah_simple():
+
+def demo_niah_simple(prev_model=None, prev_tokenizer=None):
     """簡単なNIAHテスト（修正版）"""
     print("\n🎯 簡単なNIAHテスト（RoPE スケーリング）")
     print("=" * 30)
+
+    # 前のモデルをクリーンアップ
+    if prev_model is not None or prev_tokenizer is not None:
+        cleanup_model(prev_model, prev_tokenizer)
 
     # 長文対応モデル
     model, tokenizer, _ = load_model_with_scaling(
@@ -317,6 +364,7 @@ def demo_niah_simple():
     print(f"📝 回答: {result}")
 
     format_metrics(metrics)
+    return model, tokenizer
 
 
 def main():
@@ -334,17 +382,20 @@ def main():
         # 1. 基本生成デモ
         model, tokenizer = demo_basic_generation()
 
-        # 2. 長文コンテキストデモ
-        demo_long_context(model, tokenizer)
+        # 2. 長文コンテキストデモ（前のモデルをクリーンアップ）
+        model, tokenizer = demo_long_context(model, tokenizer)
 
-        # 3. キャッシュ方式比較
-        demo_cache_comparison()
+        # 3. キャッシュ方式比較（前のモデルをクリーンアップ）
+        model, tokenizer = demo_cache_comparison(model, tokenizer)
 
-        # 4. 速度比較デモ
-        demo_speed_comparison()
+        # 4. 速度比較デモ（前のモデルをクリーンアップ）
+        model, tokenizer = demo_speed_comparison(model, tokenizer)
 
-        # 5. 簡単NIAHテスト
-        demo_niah_simple()
+        # 5. 簡単NIAHテスト（前のモデルをクリーンアップ）
+        model, tokenizer = demo_niah_simple(model, tokenizer)
+
+        # 最終クリーンアップ
+        cleanup_model(model, tokenizer)
 
         print("\n🎉 クイックスタート完了！")
         print("=" * 50)
@@ -364,11 +415,22 @@ def main():
         import traceback
         traceback.print_exc()
 
+        # エラー時の緊急メモリクリーンアップ
+        print("\n🆘 緊急メモリクリーンアップ中...")
+        if 'model' in locals():
+            del model
+        if 'tokenizer' in locals():
+            del tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         print("\n🔧 トラブルシューティング:")
-        print("  1. GPU メモリ不足 → block_length を大きく")
-        print("  2. モデル読み込みエラー → インターネット接続確認")
-        print("  3. パッケージエラー → pip install -r requirements.txt")
-        print("  4. インポートエラー → Fast-dLLM/llada パスの確認")
+        print("  1. GPU メモリ不足 → block_length を大きく、または steps を小さく")
+        print("  2. 複数モデル読み込みエラー → 一度に1つのモデルのみ使用")
+        print("  3. モデル読み込みエラー → インターネット接続確認")
+        print("  4. パッケージエラー → pip install -r requirements.txt")
+        print("  5. インポートエラー → Fast-dLLM/llada パスの確認")
 
 
 if __name__ == "__main__":

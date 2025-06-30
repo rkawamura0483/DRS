@@ -126,34 +126,92 @@ def get_num_transfer_tokens(mask_index, steps):
 
 def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
     """
-    信頼度ベースの並列デコーディング（Fast-dLLMの実装）
+    転送インデックスを取得（メモリ最適化版）
+
+    Args:
+        logits: モデルのlogits出力 (B, L, V)
+        temperature: サンプリング温度
+        remasking: リマスキング戦略
+        mask_index: マスクインデックス
+        x: 現在の入力
+        num_transfer_tokens: 転送トークン数
+        threshold: 信頼度閾値
     """
+    # メモリ最適化: float16を維持し、必要な部分のみ処理
+    device = logits.device
+    dtype = logits.dtype
+
+    # Gumbelノイズを追加してargmaxを取得
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1)
 
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+        # メモリ最適化: チャンク処理でsoftmaxを計算
+        chunk_size = 512  # チャンクサイズを調整可能
+        p_values = []
+
+        # マスクされた位置のみを処理
+        masked_positions = mask_index.any(dim=0)
+
+        for i in range(0, logits.shape[1], chunk_size):
+            end_idx = min(i + chunk_size, logits.shape[1])
+
+            # このチャンクにマスクされた位置があるかチェック
+            if not masked_positions[i:end_idx].any():
+                # マスクされた位置がない場合はスキップ
+                p_values.append(torch.zeros((logits.shape[0], end_idx - i),
+                                            device=device, dtype=dtype))
+                continue
+
+            # チャンクのlogitsを処理（float32で計算してfloat16に戻す）
+            chunk_logits = logits[:, i:end_idx].float()
+            chunk_p = F.softmax(chunk_logits, dim=-1)
+
+            # 対応するx0の値を取得
+            chunk_x0 = x0[:, i:end_idx].unsqueeze(-1)
+            chunk_x0_p = torch.gather(
+                chunk_p, dim=-1, index=chunk_x0).squeeze(-1)
+
+            p_values.append(chunk_x0_p.to(dtype))
+
+            # メモリ解放
+            del chunk_logits, chunk_p, chunk_x0_p
+
+        x0_p = torch.cat(p_values, dim=1)
+
     elif remasking == 'random':
-        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+        x0_p = torch.rand((x0.shape[0], x0.shape[1]),
+                          device=device, dtype=dtype)
     else:
         raise NotImplementedError(remasking)
 
     x0 = torch.where(mask_index, x0, x)
-    confidence = torch.where(mask_index, x0_p, -np.inf)
+    confidence = torch.where(mask_index, x0_p, -float('inf'))
 
-    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
+
     if threshold is not None:
         num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
 
+    # バッチ処理の最適化
     for j in range(confidence.shape[0]):
-        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j])
-        transfer_index[j, select_index] = True
-        if threshold is not None:
-            for k in range(1, num_transfer_tokens[j]):
-                if confidence[j, select_index[k]] < threshold:
-                    transfer_index[j, select_index[k]] = False
+        valid_confidence = confidence[j][confidence[j] != -float('inf')]
+        if len(valid_confidence) == 0:
+            continue
+
+        num_tokens = num_transfer_tokens[j].item(
+        ) if num_transfer_tokens is not None else len(valid_confidence)
+        num_tokens = min(num_tokens, len(valid_confidence))
+
+        if num_tokens > 0:
+            _, select_index = torch.topk(
+                confidence[j], k=num_tokens, largest=True)
+            transfer_index[j, select_index] = True
+
+            if threshold is not None:
+                # 閾値以下の信頼度を持つトークンを除外
+                low_conf_mask = confidence[j, select_index] < threshold
+                transfer_index[j, select_index[low_conf_mask]] = False
 
     return x0, transfer_index
 
@@ -305,6 +363,7 @@ def generate_no_cache(model, prompt, steps=128, gen_length=128, block_length=32,
                       threshold=None, scaling_factor=1):
     """
     キャッシュなし生成（Fast-dLLMの標準実装ベース）
+    メモリ最適化版
     """
     start_time = time.time()
 
@@ -342,19 +401,39 @@ def generate_no_cache(model, prompt, steps=128, gen_length=128, block_length=32,
     # フォールバック: 独自実装（キャッシュなし）
     print("⚠️  Fast-dLLM実装利用不可、独自キャッシュなし実装を使用")
 
+    # メモリ最適化: 長文の場合はblock_lengthを動的調整
+    input_length = prompt.shape[1]
+    if input_length > 2000:  # 長文の場合
+        block_length = max(64, block_length)  # より大きなブロックサイズ使用
+        steps = min(64, steps)  # ステップ数を減らしてメモリ節約
+        print(f"📏 長文対応: block_length={block_length}, steps={steps}")
+
     x = torch.full((1, prompt.shape[1] + gen_length),
-                   mask_id, dtype=torch.long).to(model.device)
+                   mask_id, dtype=torch.long, device=model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
 
-    assert gen_length % block_length == 0
+    # メモリ最適化: 必要に応じてgen_lengthを調整
+    if gen_length % block_length != 0:
+        gen_length = ((gen_length // block_length) + 1) * block_length
+        print(f"📏 生成長を調整: {gen_length} (block_length={block_length}に合わせて)")
+
     num_blocks = gen_length // block_length
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
+    steps_per_block = max(1, steps // num_blocks)
 
     nfe = 0
     total_tokens_generated = 0
 
+    # メモリ監視と早期停止機能
+    max_memory_mb = 35000  # 35GB制限（A100の場合）
+
     for num_block in range(num_blocks):
+        # メモリ使用量チェック
+        if torch.cuda.is_available():
+            current_memory = torch.cuda.memory_allocated() / (1024**3)  # GB
+            if current_memory > max_memory_mb / 1024:
+                print(f"⚠️  メモリ使用量が制限に近づいています: {current_memory:.1f}GB")
+                torch.cuda.empty_cache()
+
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
 
@@ -364,23 +443,47 @@ def generate_no_cache(model, prompt, steps=128, gen_length=128, block_length=32,
             block_mask_index, steps_per_block)
 
         i = 0
-        while True:
+        max_iterations = steps_per_block * 2  # 無限ループ防止
+
+        while i < max_iterations:
             nfe += 1
             mask_index = (x == mask_id)
-            logits = model(x).logits
-            mask_index[:, current_block_end:] = 0
 
-            x0, transfer_index = get_transfer_index(
-                logits, temperature, remasking, mask_index, x,
-                num_transfer_tokens[:,
-                                    i] if threshold is None else None, threshold
-            )
-            x[transfer_index] = x0[transfer_index]
-            total_tokens_generated += transfer_index.sum().item()
-            i += 1
+            # メモリ最適化: logitsの取得時にメモリ管理
+            try:
+                with torch.cuda.device(model.device):
+                    logits = model(x).logits
+                    # 現在のブロック以降をマスク
+                    mask_index[:, current_block_end:] = 0
 
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                break
+                    x0, transfer_index = get_transfer_index(
+                        logits, temperature, remasking, mask_index, x,
+                        num_transfer_tokens[:,
+                                            i] if threshold is None else None, threshold
+                    )
+
+                    # メモリ解放
+                    del logits
+
+                    x[transfer_index] = x0[transfer_index]
+                    total_tokens_generated += transfer_index.sum().item()
+                    i += 1
+
+                    # ブロック完了チェック
+                    if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                        break
+
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"❌ CUDA OOM エラー (ブロック {num_block}, イテレーション {i}): {e}")
+                # 緊急メモリ解放
+                torch.cuda.empty_cache()
+                # より保守的なパラメータで再試行
+                if block_length > 16:
+                    block_length = block_length // 2
+                    print(f"🔧 block_lengthを縮小: {block_length}")
+                    break
+                else:
+                    raise e
 
     # RoPEスケーリングを元に戻す
     if original_theta is not None:
@@ -444,3 +547,128 @@ def format_metrics(metrics):
     print(f"  📝 生成トークン数: {metrics['total_tokens_generated']}")
     print(f"  🧱 処理ブロック数: {metrics['blocks_processed']}")
     print(f"  📏 スケーリング係数: {metrics['scaling_factor_used']}")
+
+
+def get_memory_usage():
+    """現在のGPUメモリ使用量を取得"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)   # GB
+        total = torch.cuda.get_device_properties(
+            0).total_memory / (1024**3)  # GB
+        return {
+            'allocated': allocated,
+            'reserved': reserved,
+            'total': total,
+            'free': total - allocated
+        }
+    return None
+
+
+def optimize_parameters_for_memory(input_length, available_memory_gb=35):
+    """
+    入力長とメモリ容量に基づいて最適なパラメータを計算
+
+    Args:
+        input_length: 入力トークン数
+        available_memory_gb: 利用可能メモリ（GB）
+
+    Returns:
+        dict: 最適化されたパラメータ
+    """
+    # デフォルトパラメータ
+    params = {
+        'steps': 64,
+        'gen_length': 128,
+        'block_length': 32,
+        'remasking': 'low_confidence'
+    }
+
+    # 入力長に基づく調整
+    if input_length > 8000:
+        # 超長文（8k+）
+        params.update({
+            'steps': 8,
+            'gen_length': 64,
+            'block_length': 128,
+            'remasking': 'random'
+        })
+    elif input_length > 4000:
+        # 長文（4k+）
+        params.update({
+            'steps': 16,
+            'gen_length': 96,
+            'block_length': 96,
+            'remasking': 'random'
+        })
+    elif input_length > 2000:
+        # 中長文（2k+）
+        params.update({
+            'steps': 32,
+            'gen_length': 128,
+            'block_length': 64,
+            'remasking': 'random'
+        })
+
+    # メモリ容量に基づく調整
+    if available_memory_gb < 20:  # 20GB未満の場合
+        params['steps'] = min(params['steps'], 16)
+        params['gen_length'] = min(params['gen_length'], 64)
+        params['block_length'] = max(params['block_length'], 64)
+
+    return params
+
+
+def safe_generate_with_fallback(model, prompt, **kwargs):
+    """
+    メモリ不足時のフォールバック機能付き安全生成
+    """
+    # 入力長チェック
+    input_length = prompt.shape[1]
+    memory_info = get_memory_usage()
+
+    print(f"📏 入力長: {input_length} トークン")
+    if memory_info:
+        print(
+            f"💾 メモリ使用量: {memory_info['allocated']:.1f}GB / {memory_info['total']:.1f}GB")
+
+    # パラメータ最適化
+    available_memory = memory_info['total'] - \
+        5 if memory_info else 35  # 5GB余裕を持たせる
+    optimized_params = optimize_parameters_for_memory(
+        input_length, available_memory)
+
+    # kwargsとマージ（ユーザー指定を優先）
+    final_params = {**optimized_params, **kwargs}
+
+    print(f"🔧 最適化パラメータ: {final_params}")
+
+    # 段階的フォールバック試行
+    fallback_configs = [
+        final_params,  # 最適化済み
+        # ステップ半減
+        {**final_params, 'steps': max(8, final_params['steps'] // 2)},
+        {**final_params, 'steps': 8, 'gen_length': 32, 'block_length': 64},  # 最小構成
+    ]
+
+    for i, config in enumerate(fallback_configs):
+        try:
+            if i > 0:
+                print(f"🔄 フォールバック試行 {i}: {config}")
+                torch.cuda.empty_cache()
+
+            return generate_fast_long_dual_cache(
+                model=model,
+                prompt=prompt,
+                **config
+            )
+
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"❌ OOM エラー (試行 {i+1}): {e}")
+            if i == len(fallback_configs) - 1:
+                print("🆘 全ての設定でメモリ不足。プロセスを終了します。")
+                raise e
+            continue
+
+    # ここには到達しないはず
+    raise RuntimeError("予期しないエラー: フォールバック処理に失敗")
