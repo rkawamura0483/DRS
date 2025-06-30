@@ -420,6 +420,20 @@ def compare_vanilla_vs_fast_dllm():
     model, tokenizer, config = load_model_with_scaling(
         model_path, scaling_factor=1)
 
+    # 互換性パッチ: LLaDAModelLM が forward の未知キーワードを拒否するため generate でエラーになる
+    def _patch_forward_for_generate(m):
+        if getattr(m, "_patched_for_generate", False):
+            return  # 既にパッチ済み
+        original_forward = m.forward
+
+        def wrapped_forward(*args, **kwargs):
+            # transformers>=4.40 で追加された cache_position などを除去
+            kwargs.pop('cache_position', None)
+            return original_forward(*args, **kwargs)
+        m.forward = wrapped_forward
+        m._patched_for_generate = True
+    _patch_forward_for_generate(model)
+
     # テストプロンプト
     test_prompts = generate_test_cases()["basic"]
 
