@@ -512,7 +512,7 @@ def generate_fast_long_prefix_cache(model, prompt, steps=128, gen_length=128, bl
 
 def generate_fast_long(model, prompt, steps=128, gen_length=128, block_length=32,
                        temperature=0., remasking='low_confidence', mask_id=126336,
-                       threshold=None, use_cache=True, scaling_factor=1, dual_cache=True):
+                       threshold=None, use_cache=True, scaling_factor=1, dual_cache=True, **kwargs):
     """
     統合生成関数（キャッシュ方式を選択可能）
     """
