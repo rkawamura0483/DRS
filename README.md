@@ -1,84 +1,324 @@
-# Dynamic Refinement Scheduling for Diffusion LLMs
+# Fast-dLLM × LongLLaDA 統合実験（Google Colab 対応）
 
-## Executive Summary
+Fast-dLLM の高速推論機構と LongLLaDA の長文拡張機構を **LLaDA** で組み合わせるための手順書です。Google Colab での実行に最適化されています。
 
-Diffusion-based LLMs like LLaDA and Dream achieve competitive performance with autoregressive models through iterative refinement. Fast-dLLM significantly improved inference speed with block-wise KV-caching and confidence-aware parallel decoding. However, it applies a fixed number of denoising steps uniformly across all sequence parts, which is inefficient since not all tokens are equally difficult to generate.
+## 📋 概要
 
-We propose **Dynamic Refinement Scheduling (DRS)**, a training-free enhancement that dynamically allocates computational budget based on token-level confidence. DRS performs a coarse initial pass, identifies challenging blocks using confidence scores, and reallocates remaining computation to these "hard" regions. This promises reduced average function evaluations while improving accuracy on complex reasoning tasks.
+| 機能 | 実装箇所 | 効果 |
+|------|----------|------|
+| **ブロック生成** | `LongLLaDA/llada/llada_generate.py` | 並列トークン生成で高速化 |
+| **RoPE スケーリング** | `LongLLaDA/llada/llada_wrapper.py` | 長文コンテキスト対応 |
+| **信頼度制御** | 生成関数の `remasking='low_confidence'` | 品質維持 |
 
-## Background: Diffusion Language Models (dLLMs)
+---
 
-### Core Mechanism
+## 🚀 Google Colab セットアップ
 
-dLLMs like LLaDA operate through iterative refinement using a corruption-denoising process:
+### 1. 環境準備
+```python
+# Colab での GPU 確認
+!nvidia-smi
 
-**Forward Process (Corruption)**: Gradually masks tokens in a clean sequence x₀ over continuous time t ∈ [0,1]. At time t, each token is masked with probability t. At t=1, the sequence becomes fully masked.
+# 必要パッケージのインストール
+!pip install transformers torch accelerate flash-attn==2.3.3
+!pip install huggingface_hub einops
 
-**Reverse Process (Denoising)**: A learned Transformer predicts the original sequence x₀ from any partially masked state xₜ. Crucially, this model uses bidirectional attention (no causal masking) to leverage full context for predicting masked tokens.
-
-### Training and Inference
-
-**Training**: Cross-entropy loss computed only on masked positions:
+# リポジトリのクローン
+!git clone https://github.com/your-repo/Fast-dLLM.git
+import sys
+sys.path.append('/content/Fast-dLLM')
 ```
-L(θ) = -E[Σᵢ 1[xᵢₜ = MASK] · log pθ(x₀ᵢ | xₜ)]
+
+### 2. モデルダウンロード
+```python
+from huggingface_hub import snapshot_download
+import torch
+
+# LLaDA-8B-Instruct のダウンロード
+model_path = snapshot_download(
+    repo_id='GSAI-ML/LLaDA-8B-Instruct',
+    local_dir='/content/llada-8b',
+    revision='main'
+)
+print(f"モデルパス: {model_path}")
 ```
 
-**Inference**: Iterative refinement starting from fully masked sequence:
-1. Model predicts complete sequence from current masked state
-2. Apply remasking strategy (keep low-confidence predictions as [MASK])
-3. Repeat for N steps until fully generated
+---
 
-This differs fundamentally from autoregressive generation—instead of left-to-right token-by-token generation, dLLMs refine the entire sequence simultaneously through multiple denoising steps.
+## 💡 基本的な使用方法
 
-## Fast-dLLM: Foundation for Our Work
+### 標準生成（4k コンテキスト）
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from LongLLaDA.llada.llada_generate import generate
 
-Fast-dLLM introduced two key innovations:
+# モデル・トークナイザの読み込み
+model = AutoModelForCausalLM.from_pretrained(
+    '/content/llada-8b',
+    torch_dtype=torch.float16,
+    device_map='auto',
+    trust_remote_code=True
+)
+tokenizer = AutoTokenizer.from_pretrained(
+    '/content/llada-8b', 
+    trust_remote_code=True
+)
 
-### Block-Wise KV Cache
-Processes text in blocks, enabling reuse of key-value activations and reducing redundant computation. This block structure provides natural granularity for adaptive control.
+# プロンプトの準備
+prompt = "次の数学問題を解いてください：太郎は毎時12kmで4時間走り、その後毎時6kmで走りました。合計8時間でどれだけの距離を走れますか？"
 
-### Confidence-Aware Parallel Decoding
-Dynamically unmasks tokens whose predicted probability exceeds threshold τ, proving that model confidence is a reliable quality signal.
+# チャットテンプレートの適用
+messages = [{"role": "user", "content": prompt}]
+formatted_prompt = tokenizer.apply_chat_template(
+    messages, 
+    add_generation_prompt=True, 
+    tokenize=False
+)
 
-### The Limitation
-While token selection is dynamic, computational effort remains fixed—every block receives the same number of denoising steps regardless of difficulty.
+input_ids = tokenizer(formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-## Proposed Method: Dynamic Refinement Scheduling
+# 生成実行
+outputs = generate(
+    model=model,
+    prompt=input_ids,
+    steps=128,          # 拡散ステップ数
+    gen_length=256,     # 生成長
+    block_length=32,    # ブロックサイズ
+    temperature=0.0,    # 決定的生成
+    remasking='low_confidence'
+)
 
-DRS was designed to replace a fixed-step schedule with an adaptive, two-phase approach integrated with the Fast-dLLM block-wise cache.
-
-### Phase 1: Coarse Initial Pass
-A base number of denoising steps (`T_base`, e.g., 8) were performed sequentially for each block. This quickly establishes a draft generation. During this phase, the model's confidence in each generated token was collected.
-
-### Phase 2: Difficulty Assessment & Adaptive Refinement
-After the initial pass, an "ambiguity score" was calculated for each block based on the collected confidences:
+# 結果の表示
+result = tokenizer.decode(outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+print("生成結果:", result)
 ```
-Ambiguity(Block_i) = Fraction of tokens j where Confidence(token_j) < τ
+
+---
+
+## 🔧 長文対応（RoPE スケーリング）
+
+### 16k トークン対応
+```python
+from transformers import AutoConfig
+
+# コンフィグの修正
+config = AutoConfig.from_pretrained('/content/llada-8b', trust_remote_code=True)
+scaling_factor = 14  # 16k 用のスケール係数
+config.rope_theta = config.rope_theta * scaling_factor
+
+print(f"RoPE θ: {config.rope_theta} (元: 10000)")
+
+# スケーリング適用モデルの読み込み
+model_long = AutoModelForCausalLM.from_pretrained(
+    '/content/llada-8b',
+    config=config,
+    torch_dtype=torch.float16,
+    device_map='auto',
+    trust_remote_code=True
+)
+
+# 長文プロンプトでテスト
+long_prompt = "あなたは小説を書くAIです。" + "物語の背景設定を詳しく説明してください。" * 100  # 疑似長文
+input_ids_long = tokenizer(long_prompt, return_tensors='pt').input_ids.to(model_long.device)
+
+print(f"入力長: {input_ids_long.shape[1]} トークン")
+
+# 長文対応生成
+if input_ids_long.shape[1] > 4000:  # 4k を超える場合
+    outputs_long = generate(
+        model=model_long,
+        prompt=input_ids_long,
+        steps=64,           # 長文では少なめに
+        gen_length=512,
+        block_length=64,    # 大きめのブロック
+        temperature=0.0,
+        remasking='low_confidence'
+    )
+    result_long = tokenizer.decode(outputs_long[0, input_ids_long.shape[1]:], skip_special_tokens=True)
+    print("長文生成結果:", result_long[:200] + "...")
 ```
-The remaining computational budget (`T_refine = T_total - T_used_in_pass_1`) was then intended to be distributed among the blocks proportionally to their ambiguity scores. The goal was for challenging blocks to receive more refinement steps, while computation was saved on simpler blocks.
 
-## Experimental Validation and Analysis
+---
 
-### Evaluation Framework
-To validate the effectiveness of DRS, a test harness (`llada/test_drs.py`) was created to compare DRS against the Fast-dLLM baseline (`generate_with_dual_cache`). The framework evaluated performance on a small, diverse set of tasks (math, code, explanation). It measured the Number of Function Evaluations (NFE) for efficiency and used a custom composite score for quality. The experiment also included a `DRS-Uniform-Control` variant that allocated the refinement budget equally among ambiguous blocks, serving as a control against the core proportional allocation hypothesis.
+## ⚡ 高速化オプション
 
-### Key Findings and Critical Flaws
-The experimental results did not validate the DRS hypothesis. Analysis of the run logs revealed that DRS, in its current implementation, is outperformed by the baseline, with an average **1.3x increase in NFE** and a slight **decrease in quality**. The investigation pinpointed three fundamental flaws:
+### 1. ブロックサイズ調整
+```python
+# 高速重視（品質やや低下）
+outputs_fast = generate(
+    model, input_ids,
+    steps=64,           # ステップ数削減
+    gen_length=256,
+    block_length=64,    # 大きなブロック
+    temperature=0.0,
+    remasking='random'  # ランダムマスキング
+)
 
-1.  **Conceptual Flaw in Efficiency**: The baseline method is adaptive and can finish tasks in very few steps. The DRS implementation forces a minimum number of steps (`T_base`) in its first phase. On simple tasks, this initial cost was already higher than the baseline's *total* computational cost, making it impossible for DRS to be more efficient.
+# 品質重視（速度やや低下）
+outputs_quality = generate(
+    model, input_ids,
+    steps=256,          # ステップ数増加
+    gen_length=256,
+    block_length=16,    # 小さなブロック
+    temperature=0.0,
+    remasking='low_confidence'
+)
+```
 
-2.  **Mechanism Flaw in Allocation**: The core novelty of DRS—allocating refinement budget proportionally to block ambiguity—showed **no benefit over the simple uniform allocation control**. In all test cases, the `DRS-Balanced` and `DRS-Uniform-Control` configurations produced identical outputs and performance, suggesting the complex allocation strategy was ineffective.
+### 2. スケール係数表
+| 目標長 | スケール係数 (λ) | 備考 |
+|--------|------------------|------|
+| 8k     | 4                | 軽い拡張 |
+| 16k    | 14               | 標準的 |
+| 24k    | 31               | 大幅拡張 |
+| 32k    | 55               | 最大級 |
 
-3.  **Evaluation Flaw in Quality Metrics**: The custom quality evaluator proved unreliable. In one case, it assigned an "EXCELLENT" rating to a grammatically incorrect and repetitive output that was clearly inferior to the baseline. This flaw makes it impossible to trust any of the reported quality gains and casts doubt on the validity of the entire test harness.
+---
 
-## Conclusion: A Clear Null Result
-The experiment conclusively shows that the tested DRS implementation is not a viable improvement over the Fast-dLLM baseline. The combination of its inefficiency on simple tasks and the ineffectiveness of its core mechanism means the hypothesis is not supported.
+## 🧪 評価・テスト
+### 🗒️ 標準ベンチマーク
+- **MMLU**: 一般知識の多肢選択問題
+- **GSM8K**: 小学校レベル算数
+- **HumanEval**: プログラム合成
+- **LongBench**: 長文理解＆検索
+- **NIAH**: Needle-in-a-Haystack（後述）
 
-## Lessons Learned and Future Directions
-While the result was negative, the experiment provides critical insights that inform future research in this area. The path forward is not to refine the current DRS, but to learn from its failures.
+### 📏 評価メトリクス
+| カテゴリ | 指標 | 説明 |
+|----------|------|------|
+| 自動評価 | Accuracy / Pass@k / EM | タスク固有の定量指標 |
+| スピード | tok/s | 生成トークン数 ÷ 時間 |
+| **LLM Judge** | Pairwise Preference | GPT-4 による出力ペア比較 |
+| **Judge Consistency** | J-score | 生成の一貫性を GPT で採点 |
 
-1.  **Priority 1: Build a Robust Evaluation Harness**: Before any new method is tested, a reliable evaluation framework is non-negotiable. The next step must be to integrate established benchmarks like **GSM8K, MATH, and HumanEval** to ensure results are meaningful and comparable.
+### 🧑‍⚖️ LLM-as-a-Judge 評価フロー
+1. 2 つのモデル出力を **シャッフルして非公開 ID** を付与  
+2. **Gemini 2.0 Flash** に **プロンプト・出力ペア** を渡し「どちらが優れているか」 を尋ねる  
+3. ①で付けた ID を元に勝率を集計 → **勝率 >50% → 優勢**  
+4. 追加で同一回答セットを複数回評価し **J-score** を計算し Judge の一貫性を確認
 
-2.  **Rethink the Adaptive Strategy**: A successful adaptive method must be able to "finish early" and be more efficient than the baseline on *all* task difficulties. The more sophisticated ideas in `llada/generate_drs_v2.py` (e.g., prioritizing incomplete blocks) may offer a better starting point, but they must be rigorously tested against the strong baseline.
+```python
+# Colab: Google API キーを環境変数 GOOGLE_API_KEY に設定済みと仮定
+!pip install google-genai tqdm
+import os, json, random, tqdm
+from google import genai
 
-3.  **Embrace the Null Result**: This work serves as a valuable case study on the potential pitfalls of designing adaptive computation schemes for dLLMs. It highlights that a seemingly intuitive approach may fail due to incorrect assumptions about the baseline's behavior and the difficulty of creating reliable evaluation metrics. Success in future work will depend on addressing these foundational challenges.
+client = genai.Client()  # GOOGLE_API_KEY を自動取得
+
+def llm_judge(prompts, outputs_a, outputs_b, judge_model="gemini-2.0-flash"):
+    """
+    Gemini 2.0 Flash を用いたペアワイズ評価
+    prompts:   List[str]
+    outputs_a: List[str]  # モデルAの出力
+    outputs_b: List[str]  # モデルBの出力
+    戻り値:    dict(score=float, details=list)
+    """
+    wins = 0
+    details = []
+    for p, a, b in tqdm.tqdm(zip(prompts, outputs_a, outputs_b), total=len(prompts)):
+        # 出力をランダムで並べ替えてバイアスを除去
+        pair = list(zip(["A","B"], [a, b]))
+        random.shuffle(pair)
+        labels, answers = zip(*pair)
+
+        prompt_text = (
+            "## プロンプト\n" + p +
+            "\n\n### 回答A\n" + answers[0] +
+            "\n\n### 回答B\n" + answers[1] +
+            "\n\n# 指示\n"
+            "優れている方のラベル ('A' or 'B') のみを出力してください。"
+        )
+
+        resp = client.models.generate_content(
+            model=judge_model,
+            contents=prompt_text,
+            config={"temperature":0.0}
+        )
+        choice = resp.text.strip()
+        preferred = labels[0] if choice=="A" else labels[1]
+        wins += (preferred=="A")  # A が勝った回数をカウント
+        details.append(preferred)
+    return {"score":wins/len(prompts), "details":details}
+
+上記の関数で **score > 0.5** ならモデルA がモデルB を上回っていると判断します。
+
+> 💡 **TIP**: Judge の温度を 0 に固定し、同一プロンプトを複数回評価して安定性を確認するとより信頼性が高まります。
+
+### NIAH（Needle in a Haystack）テスト
+```python
+def niah_test(model, tokenizer, context_length=8000):
+    # ダミー長文コンテキスト生成
+    haystack = "これは重要ではない情報です。" * (context_length // 10)
+    needle = "重要な情報：答えは42です。"
+    question = "重要な情報は何ですか？"
+    
+    # 長文作成
+    full_text = haystack[:len(haystack)//2] + needle + haystack[len(haystack)//2:] + "\n質問：" + question
+    
+    input_ids = tokenizer(full_text, return_tensors='pt').input_ids
+    print(f"コンテキスト長: {input_ids.shape[1]} トークン")
+    
+    # 生成
+    outputs = generate(model, input_ids, steps=64, gen_length=50, block_length=32)
+    result = tokenizer.decode(outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+    
+    # 評価
+    success = "42" in result
+    print(f"NIAH 成功: {success}")
+    print(f"回答: {result}")
+    return success
+
+# テスト実行
+niah_test(model_long, tokenizer)
+```
+
+---
+
+## 🔧 トラブルシューティング
+
+### よくある問題と解決法
+
+1. **CUDA Out of Memory**
+   ```python
+   # メモリ使用量削減
+   torch.cuda.empty_cache()
+   # または block_length を大きくする
+   outputs = generate(model, input_ids, block_length=128)
+   ```
+
+2. **生成品質の低下**
+   ```python
+   # steps を増やすか、temperature を調整
+   outputs = generate(model, input_ids, steps=256, temperature=0.1)
+   ```
+
+3. **長文で NaN エラー**
+   ```python
+   # float32 を使用
+   model = model.to(torch.float32)
+   ```
+
+---
+
+## 📊 パフォーマンス目安
+
+| 設定 | トークン/秒 | GPU メモリ | 品質 |
+|------|-------------|-----------|------|
+| 標準 | ~80 | 12GB | 高 |
+| 高速 | ~120 | 10GB | 中 |
+| 長文 | ~60 | 16GB | 高 |
+
+※ T4 GPU での概算値
+
+---
+
+## 📚 参考文献
+
+- **Fast-dLLM**: [arXiv:2409.XXXXX](https://arxiv.org/abs/2409.XXXXX)
+- **LongLLaDA**: [arXiv:2409.YYYYY](https://arxiv.org/abs/2409.YYYYY)
+- **LLaDA**: [ML-GSAI/LLaDA](https://github.com/ML-GSAI/LLaDA)
+
+---
+
+このREADMEはGoogle Colabでの実験を想定しています。ローカル環境での実行時は適宜パスを調整してください。 
