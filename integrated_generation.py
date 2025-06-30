@@ -12,33 +12,49 @@ import time
 import sys
 import os
 import glob
+import subprocess
 
 # Fast-dLLMのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
 print(f"🔍 現在のディレクトリ: {current_dir}")
 
-# Colab環境での診断
-possible_paths = [
-    # 現在のディレクトリからの相対パス
-    os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model'),
-    os.path.join(current_dir, 'Fast-dLLM', 'llada'),
-    # 直接のFast-dLLMディレクトリ
-    os.path.join(current_dir, 'Fast-dLLM'),
-    # 親ディレクトリからの検索
-    os.path.join(os.path.dirname(current_dir), 'Fast-dLLM', 'llada', 'model'),
-    os.path.join(os.path.dirname(current_dir), 'Fast-dLLM', 'llada'),
-]
 
-print("📁 ディレクトリ診断:")
-for path in possible_paths:
-    exists = os.path.exists(path)
-    print(f"  {path}: {'✅' if exists else '❌'}")
-    if exists and os.path.isdir(path):
-        try:
-            contents = os.listdir(path)[:5]  # 最初の5項目のみ
-            print(f"    内容: {contents}")
-        except:
-            pass
+def auto_clone_repositories():
+    """Fast-dLLMとLongLLaDAリポジトリを自動クローン"""
+    repositories = [
+        {
+            "name": "Fast-dLLM",
+            "url": "https://github.com/NVlabs/Fast-dLLM.git",
+            "dir": os.path.join(current_dir, "Fast-dLLM")
+        },
+        {
+            "name": "LongLLaDA",
+            "url": "https://github.com/OpenMOSS/LongLLaDA.git",
+            "dir": os.path.join(current_dir, "LongLLaDA")
+        }
+    ]
+
+    cloned_any = False
+    for repo in repositories:
+        if not os.path.exists(repo['dir']):
+            print(f"📥 {repo['name']} が見つかりません。クローン中...")
+            try:
+                subprocess.run(
+                    f"git clone {repo['url']} {repo['dir']}",
+                    shell=True, check=True, cwd=current_dir
+                )
+                print(f"✅ {repo['name']} のクローン完了")
+                cloned_any = True
+            except subprocess.CalledProcessError as e:
+                print(f"❌ {repo['name']} のクローン失敗: {e}")
+
+    return cloned_any
+
+
+# 必要なリポジトリが存在しない場合は自動クローン
+if not os.path.exists(os.path.join(current_dir, 'Fast-dLLM')) or not os.path.exists(os.path.join(current_dir, 'LongLLaDA')):
+    print("🔄 必要なリポジトリが見つかりません。自動セットアップを開始...")
+    auto_clone_repositories()
 
 # modeling_llada.pyファイルを探す
 print("\n🔍 modeling_llada.py を検索中...")
@@ -53,12 +69,10 @@ for root, dirs, files in os.walk(current_dir):
             root) if root.endswith('model') else root
         break
 else:
-    # フォールバック: project layout情報から推測
-    print("🔍 プロジェクトレイアウトから推測...")
-    model_path = os.path.join(current_dir, 'Fast-dLLM',
-                              'Fast-dLLM', 'llada', 'model')
-    generate_path = os.path.join(
-        current_dir, 'Fast-dLLM', 'Fast-dLLM', 'llada')
+    # フォールバック: 標準的なパス
+    print("🔍 標準パスを使用...")
+    model_path = os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model')
+    generate_path = os.path.join(current_dir, 'Fast-dLLM', 'llada')
 
 print(f"📍 使用するパス:")
 print(f"  - モデルパス: {model_path}")

@@ -1,5 +1,25 @@
 # Fast-dLLM × LongLLaDA 統合実験（Google Colab 対応）
 
+## 🚀 超簡単 Colab セットアップ（推奨）
+
+**3つのコマンドだけで開始！**
+
+```python
+# 1. リポジトリをクローン
+!git clone https://github.com/your-username/your-repo-name.git
+%cd your-repo-name
+
+# 2. 自動セットアップ（Fast-dLLM と LongLLaDA が自動クローンされます）
+!python setup_colab.py
+
+# 3. デモ実行
+!python quick_start.py
+```
+
+> **✨ 新機能**: `integrated_generation.py` が **自動的に** Fast-dLLM と LongLLaDA をクローンします！手動セットアップは不要です。
+
+---
+
 Fast-dLLM の高速推論機構と LongLLaDA の長文拡張機構を **LLaDA** で組み合わせるための手順書です。Google Colab での実行に最適化されています。
 
 ## 📋 概要
