@@ -283,7 +283,7 @@ def niah_test(model, tokenizer, needle_info: str = "重要な情報：答えは4
         outputs, nfe, metrics = generate_fast_long(
             model=model,
             prompt=input_ids,
-            gen_length=100,
+            gen_length=128,
             steps=64,
             block_length=32,
             temperature=0.0,
@@ -372,9 +372,9 @@ def compare_scaling_factors():
                 output_ids, nfe, metrics = generate_fast_long(
                     model=model,
                     prompt=input_ids,
-                    gen_length=200,
+                    gen_length=256,
                     steps=64,
-                    block_length=64,  # 長文用の大きなブロック
+                    block_length=32,
                     temperature=0.0,
                     remasking='low_confidence',
                     dual_cache=True
@@ -466,9 +466,10 @@ def compare_vanilla_vs_fast_dllm():
             )
         vanilla_time = time.time() - start_time
 
+        # special_tokens をスキップすると <assistant> なども除去され何も残らない場合がある
         result_vanilla = tokenizer.decode(
-            vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=True
-        )
+            vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=False
+        ).replace("<|assistant|>", "").replace("<|endoftext|>", "").strip()
         outputs_vanilla.append(result_vanilla)
 
         # 標準生成のメトリクス
