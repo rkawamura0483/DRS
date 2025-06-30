@@ -14,22 +14,19 @@ import os
 import glob
 
 # Fast-dLLMのパスを追加
-print(f"🔍 現在のディレクトリ: {os.path.dirname(os.path.abspath(__file__))}")
+current_dir = os.path.dirname(os.path.abspath(__file__))
+print(f"🔍 現在のディレクトリ: {current_dir}")
 
 # Colab環境での診断
 possible_paths = [
     # 現在のディレクトリからの相対パス
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 'Fast-dLLM', 'llada', 'model'),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 'Fast-dLLM', 'llada'),
+    os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model'),
+    os.path.join(current_dir, 'Fast-dLLM', 'llada'),
     # 直接のFast-dLLMディレクトリ
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Fast-dLLM'),
+    os.path.join(current_dir, 'Fast-dLLM'),
     # 親ディレクトリからの検索
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 'Fast-dLLM', 'llada', 'model'),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 'Fast-dLLM', 'llada'),
+    os.path.join(os.path.dirname(current_dir), 'Fast-dLLM', 'llada', 'model'),
+    os.path.join(os.path.dirname(current_dir), 'Fast-dLLM', 'llada'),
 ]
 
 print("📁 ディレクトリ診断:")
@@ -45,7 +42,10 @@ for path in possible_paths:
 
 # modeling_llada.pyファイルを探す
 print("\n🔍 modeling_llada.py を検索中...")
-for root, dirs, files in os.walk(os.path.dirname(os.path.abspath(__file__))):
+model_path = None
+generate_path = None
+
+for root, dirs, files in os.walk(current_dir):
     if 'modeling_llada.py' in files:
         print(f"✅ 見つかりました: {root}")
         model_path = root
@@ -55,10 +55,10 @@ for root, dirs, files in os.walk(os.path.dirname(os.path.abspath(__file__))):
 else:
     # フォールバック: project layout情報から推測
     print("🔍 プロジェクトレイアウトから推測...")
-    model_path = os.path.join(os.path.dirname(os.path.abspath(
-        __file__)), 'Fast-dLLM', 'Fast-dLLM', 'llada', 'model')
-    generate_path = os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), 'Fast-dLLM', 'Fast-dLLM', 'llada')
+    model_path = os.path.join(current_dir, 'Fast-dLLM',
+                              'Fast-dLLM', 'llada', 'model')
+    generate_path = os.path.join(
+        current_dir, 'Fast-dLLM', 'Fast-dLLM', 'llada')
 
 print(f"📍 使用するパス:")
 print(f"  - モデルパス: {model_path}")
