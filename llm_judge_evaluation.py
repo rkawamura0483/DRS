@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 LLM-as-a-Judge 評価スクリプト
+Fast-dLLM × LongLLaDA 統合実験用
 Gemini 2.0 Flash を用いたペアワイズ評価
 """
 
@@ -8,7 +9,8 @@ import os
 import json
 import random
 import time
-from typing import List, Dict, Tuple, Optional
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Union
 import torch
 from tqdm import tqdm
 
@@ -25,7 +27,7 @@ from integrated_generation import generate_fast_long, load_model_with_scaling
 
 
 class LLMJudge:
-    """LLM-as-a-Judge 評価クラス"""
+    """LLM-as-a-Judge 評価クラス（Fast-dLLM × LongLLaDA 統合実験用）"""
 
     def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash"):
         """
@@ -51,18 +53,11 @@ class LLMJudge:
     def judge_pair(self, prompt: str, output_a: str, output_b: str,
                    criteria: str = "一般的な品質") -> Tuple[str, str]:
         """
-        2つの出力をペアワイズ評価
-
-        Args:
-            prompt: 元のプロンプト
-            output_a: 出力A
-            output_b: 出力B
-            criteria: 評価基準
-
-        Returns:
-            (preferred_output, reasoning): 優れた出力（'A' or 'B'）と理由
+        READMEで示されている評価フローに従った2つの出力のペアワイズ評価
+        - シャッフルして非公開IDを付与
+        - 温度0で一貫性を保つ
         """
-        # ランダムに順序を入れ替えてバイアスを除去
+        # ランダムに順序を入れ替えてバイアスを除去（READMEの評価フロー）
         if random.choice([True, False]):
             first, second = output_a, output_b
             labels = ["A", "B"]
@@ -70,52 +65,51 @@ class LLMJudge:
             first, second = output_b, output_a
             labels = ["B", "A"]
 
-        judge_prompt = f"""以下の2つのAI出力を比較し、どちらが優れているかを判断してください。
-
-評価基準: {criteria}
-
-【元のプロンプト】
+        judge_prompt = f"""## プロンプト
 {prompt}
 
-【出力1】
+### 回答A
 {first}
 
-【出力2】  
+### 回答B
 {second}
 
-【指示】
-上記の2つの出力を比較し、以下の観点で評価してください：
+# 指示
+評価基準「{criteria}」に基づいて、以下の観点で2つの回答を比較してください：
+
+**評価観点:**
 - 正確性と事実性
-- 明確性と理解しやすさ
+- 明確性と理解しやすさ  
 - 質問への適切な回答
 - 有用性
+- 長文処理能力（該当する場合）
+- 一貫性
 
-まず簡潔な理由を述べ、最後に「判定: 1」または「判定: 2」で結論してください。"""
+まず簡潔な理由を述べ、最後に優れている方のラベル ('A' or 'B') のみを出力してください。"""
 
         try:
             response = self.model.generate_content(
                 judge_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.0,
+                    temperature=0.0,  # READMEで推奨されている温度0
                     max_output_tokens=500
                 )
             )
 
             response_text = response.text.strip()
 
-            # 判定結果を抽出
-            if "判定: 1" in response_text:
+            # 判定結果を抽出（READMEのフローに従う）
+            if response_text.endswith('A'):
                 preferred = labels[0]
-            elif "判定: 2" in response_text:
+            elif response_text.endswith('B'):
+                preferred = labels[1]
+            elif "A" in response_text.split()[-3:]:  # 最後の方でAが言及
+                preferred = labels[0]
+            elif "B" in response_text.split()[-3:]:  # 最後の方でBが言及
                 preferred = labels[1]
             else:
-                # フォールバック：より詳細な解析
-                if "1の方が" in response_text or "出力1" in response_text:
-                    preferred = labels[0]
-                elif "2の方が" in response_text or "出力2" in response_text:
-                    preferred = labels[1]
-                else:
-                    preferred = random.choice(labels)  # ランダム選択
+                # フォールバック
+                preferred = random.choice(labels)
 
             return preferred, response_text
 
@@ -123,21 +117,45 @@ class LLMJudge:
             print(f"⚠️ 判定エラー: {e}")
             return random.choice(labels), f"エラーのためランダム選択: {e}"
 
+    def calculate_j_score(self, prompts: List[str], outputs_a: List[str],
+                          outputs_b: List[str], criteria: str, num_repeats: int = 3) -> float:
+        """
+        Judge Consistency (J-score) を計算
+        同一プロンプトセットを複数回評価し、一貫性を測定
+        """
+        print(f"🔄 Judge Consistency 計算中 (評価回数: {num_repeats})")
+
+        all_preferences = []
+
+        for repeat in range(num_repeats):
+            preferences = []
+            for prompt, out_a, out_b in tqdm(zip(prompts, outputs_a, outputs_b),
+                                             desc=f"評価 {repeat+1}/{num_repeats}"):
+                preferred, _ = self.judge_pair(prompt, out_a, out_b, criteria)
+                preferences.append(1 if preferred == "A" else 0)
+                time.sleep(0.3)  # レート制限対策
+
+            all_preferences.append(preferences)
+
+        # 一貫性スコア計算（各プロンプトでの評価の分散の平均）
+        consistency_scores = []
+        for i in range(len(prompts)):
+            votes = [prefs[i] for prefs in all_preferences]
+            # 分散が小さいほど一貫性が高い
+            variance = np.var(votes)
+            consistency_scores.append(1 - variance)  # 1に近いほど一貫
+
+        j_score = np.mean(consistency_scores)
+        print(f"📊 Judge Consistency (J-score): {j_score:.3f}")
+
+        return j_score
+
     def evaluate_multiple(self, prompts: List[str], outputs_a: List[str],
                           outputs_b: List[str], criteria: str = "一般的な品質",
-                          labels: Tuple[str, str] = ("モデルA", "モデルB")) -> Dict:
+                          labels: Tuple[str, str] = ("モデルA", "モデルB"),
+                          calculate_consistency: bool = True) -> Dict:
         """
-        複数のプロンプトに対してペアワイズ評価
-
-        Args:
-            prompts: プロンプトリスト
-            outputs_a: モデルAの出力リスト
-            outputs_b: モデルBの出力リスト
-            criteria: 評価基準
-            labels: モデルのラベル
-
-        Returns:
-            評価結果の辞書
+        複数のプロンプトに対してペアワイズ評価（READMEの評価フロー準拠）
         """
         if not (len(prompts) == len(outputs_a) == len(outputs_b)):
             raise ValueError("プロンプトと出力の数が一致しません")
@@ -184,28 +202,215 @@ class LLMJudge:
             "detailed_results": results
         }
 
+        # Judge Consistency 計算
+        if calculate_consistency and len(prompts) >= 3:
+            try:
+                j_score = self.calculate_j_score(prompts[:min(5, len(prompts))],
+                                                 outputs_a[:min(
+                                                     5, len(outputs_a))],
+                                                 outputs_b[:min(5, len(outputs_b))], criteria)
+                evaluation_result["j_score"] = j_score
+            except Exception as e:
+                print(f"⚠️ J-score 計算エラー: {e}")
+                evaluation_result["j_score"] = None
+
         return evaluation_result
 
 
 def generate_test_cases():
-    """テスト用のプロンプトを生成"""
-    test_prompts = [
+    """READMEの研究目的に沿ったテスト用プロンプトを生成"""
+    # 基本的なプロンプト
+    basic_prompts = [
         "次の数学問題を解いてください：太郎は毎時12kmで4時間走り、その後毎時6kmで走りました。合計8時間でどれだけの距離を走れますか？",
         "Pythonでリストから重複を除去する方法を3つ教えてください。",
         "日本の四季について短い詩を書いてください。",
         "機械学習の教師あり学習と教師なし学習の違いを説明してください。",
         "健康的な生活習慣について5つのアドバイスをください。",
-        "気候変動問題の解決策を3つ提案してください。",
-        "小説の主人公の心理描写を含む短い文章を書いてください。",
-        "データサイエンスプロジェクトの進め方を段階的に説明してください。"
     ]
 
-    return test_prompts
+    # 長文処理テスト用プロンプト
+    long_context_prompts = [
+        "次の長い物語の要約を書いてください：" + "昔々、ある村に勇敢な少年がいました。" * 100 + " この物語の主要なテーマは何ですか？",
+        "以下の技術文書の要点を整理してください：" + "機械学習は現代のAI技術の基盤です。" * 150 + " 最も重要なポイントを3つ挙げてください。",
+        "この長いコードの動作を説明してください：\n```python\n" + "# 重要な処理\nresult = process_data()\n" *
+        80 + "```\nこのコードの目的は何ですか？",
+    ]
+
+    return {
+        "basic": basic_prompts,
+        "long_context": long_context_prompts,
+        "all": basic_prompts + long_context_prompts
+    }
+
+
+def niah_test(model, tokenizer, needle_info: str = "重要な情報：答えは42です。",
+              question: str = "重要な情報は何ですか？", context_length: int = 4000) -> Dict:
+    """
+    NIAH (Needle in a Haystack) テスト実装（READMEで言及されているテスト）
+
+    Args:
+        model: 評価対象モデル
+        tokenizer: トークナイザ
+        needle_info: 探すべき情報
+        question: 質問
+        context_length: コンテキスト長（トークン数の目安）
+
+    Returns:
+        NAIHテスト結果
+    """
+    print(f"🔍 NIAH テスト開始 (目標コンテキスト長: {context_length})")
+
+    # ダミーコンテキスト生成
+    dummy_text = "これは重要ではない情報です。自然言語処理技術の発展により、大規模言語モデルが注目されています。"
+    haystack = (dummy_text + " ") * (context_length // len(dummy_text.split()))
+
+    # needleを途中に埋め込み
+    haystack_words = haystack.split()
+    insert_position = len(haystack_words) // 2
+    haystack_words.insert(insert_position, needle_info)
+
+    full_context = " ".join(haystack_words) + f"\n\n質問：{question}\n回答："
+
+    # トークナイズ
+    input_ids = tokenizer(
+        full_context, return_tensors='pt').input_ids.to(model.device)
+    actual_length = input_ids.shape[1]
+
+    print(f"📏 実際のコンテキスト長: {actual_length} トークン")
+
+    # 生成実行
+    try:
+        outputs, nfe, metrics = generate_fast_long(
+            model=model,
+            prompt=input_ids,
+            gen_length=100,
+            steps=64,
+            block_length=32,
+            temperature=0.0,
+            remasking='low_confidence',
+            dual_cache=True
+        )
+
+        result = tokenizer.decode(
+            outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+
+        # 成功判定
+        success = "42" in result
+
+        niah_result = {
+            "success": success,
+            "context_length": actual_length,
+            "needle_position": insert_position / len(haystack_words),
+            "generated_answer": result.strip(),
+            "target_answer": "42",
+            "needle_info": needle_info,
+            "question": question,
+            "nfe": nfe,
+            "speed": metrics.get('tokens_per_second', 0)
+        }
+
+        print(f"✅ NIAH 成功: {success}")
+        print(f"🎯 生成された回答: {result.strip()[:100]}...")
+
+        return niah_result
+
+    except Exception as e:
+        print(f"❌ NIAH テストエラー: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "context_length": actual_length,
+            "needle_info": needle_info,
+            "question": question
+        }
+
+
+def compare_scaling_factors():
+    """
+    READMEのスケール係数表に基づく比較実験
+    8k, 16k, 24k, 32k の各設定での性能評価
+    """
+    print("🔢 RoPE スケーリング係数比較実験")
+
+    # モデル読み込み
+    model_path = 'GSAI-ML/LLaDA-8B-Instruct'
+
+    # READMEのスケール係数表
+    scaling_configs = [
+        {"name": "8k設定", "target_length": 8000, "scaling_factor": 4},
+        {"name": "16k設定", "target_length": 16000, "scaling_factor": 14},
+        {"name": "24k設定", "target_length": 24000, "scaling_factor": 31},
+        {"name": "32k設定", "target_length": 32000, "scaling_factor": 55},
+    ]
+
+    # テストプロンプト
+    test_prompts = generate_test_cases()["long_context"][:3]  # 長文テスト用
+
+    results = {}
+
+    for config in scaling_configs:
+        print(f"\n🧪 {config['name']} 評価中...")
+
+        try:
+            # スケーリング適用モデルの読み込み
+            model, tokenizer, model_config = load_model_with_scaling(
+                model_path, scaling_factor=config["scaling_factor"])
+
+            outputs = []
+            niah_results = []
+
+            for prompt in test_prompts:
+                # フォーマット
+                messages = [{"role": "user", "content": prompt}]
+                formatted_prompt = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
+                )
+                input_ids = tokenizer(
+                    formatted_prompt, return_tensors='pt').input_ids.to(model.device)
+
+                # 生成実行
+                output_ids, nfe, metrics = generate_fast_long(
+                    model=model,
+                    prompt=input_ids,
+                    gen_length=200,
+                    steps=64,
+                    block_length=64,  # 長文用の大きなブロック
+                    temperature=0.0,
+                    remasking='low_confidence',
+                    dual_cache=True
+                )
+
+                result = tokenizer.decode(
+                    output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+                outputs.append(result)
+
+            # NAIHテスト
+            niah_result = niah_test(model, tokenizer,
+                                    # 実用的な長さ
+                                    context_length=config["target_length"]//2)
+            niah_results.append(niah_result)
+
+            results[config["name"]] = {
+                "outputs": outputs,
+                "niah_results": niah_results,
+                "scaling_factor": config["scaling_factor"],
+                "target_length": config["target_length"]
+            }
+
+            # メモリクリア
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"❌ {config['name']} エラー: {e}")
+            results[config["name"]] = {"error": str(e)}
+
+    return test_prompts, results
 
 
 def compare_configurations():
-    """異なる設定での生成結果を比較"""
-    print("🆚 設定比較実験")
+    """READMEの設定に基づく異なる設定での生成結果を比較"""
+    print("🆚 設定比較実験（READMEベース）")
 
     # モデル読み込み
     model_path = 'GSAI-ML/LLaDA-8B-Instruct'
@@ -213,26 +418,30 @@ def compare_configurations():
         model_path, scaling_factor=1)
 
     # テストプロンプト
-    test_prompts = generate_test_cases()
+    test_prompts = generate_test_cases()["basic"]
 
-    # 設定A: 高速設定
+    # READMEの設定A: 高速設定
     config_a = {
         "name": "高速設定",
         "steps": 64,
-        "block_length": 32,
-        "remasking": "random"
+        "block_length": 64,  # READMEより大きなブロック
+        "remasking": "random",  # READMEの高速設定
+        "temperature": 0.0
     }
 
-    # 設定B: 品質重視設定
+    # READMEの設定B: 品質重視設定
     config_b = {
         "name": "品質重視設定",
-        "steps": 256,
-        "block_length": 32,
-        "remasking": "low_confidence"
+        "steps": 256,  # READMEより多いステップ
+        "block_length": 16,  # READMEより小さなブロック
+        "remasking": "low_confidence",
+        "temperature": 0.0  # READMEで推奨
     }
 
     outputs_a = []
     outputs_b = []
+    metrics_a = []
+    metrics_b = []
 
     print(f"🔄 {len(test_prompts)} プロンプトで生成中...")
 
@@ -246,27 +455,29 @@ def compare_configurations():
             formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
         # 設定Aで生成
-        outputs_a_raw, _, _ = generate_fast_long(
+        outputs_a_raw, nfe_a, metrics_a_raw = generate_fast_long(
             model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_a
         )
         result_a = tokenizer.decode(
             outputs_a_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
         outputs_a.append(result_a)
+        metrics_a.append({"nfe": nfe_a, **metrics_a_raw})
 
         # 設定Bで生成
-        outputs_b_raw, _, _ = generate_fast_long(
+        outputs_b_raw, nfe_b, metrics_b_raw = generate_fast_long(
             model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_b
         )
         result_b = tokenizer.decode(
             outputs_b_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
         outputs_b.append(result_b)
+        metrics_b.append({"nfe": nfe_b, **metrics_b_raw})
 
-    return test_prompts, outputs_a, outputs_b, config_a["name"], config_b["name"]
+    return test_prompts, outputs_a, outputs_b, config_a["name"], config_b["name"], metrics_a, metrics_b
 
 
-def run_judge_evaluation():
-    """LLM Judge 評価の実行"""
-    print("🧑‍⚖️ LLM-as-a-Judge 評価実験")
+def run_comprehensive_evaluation():
+    """READMEの研究目的に沿った包括的な評価実験"""
+    print("🎯 Fast-dLLM × LongLLaDA 包括的評価実験")
 
     # API キー確認
     if not os.getenv('GOOGLE_API_KEY'):
@@ -279,42 +490,83 @@ def run_judge_evaluation():
         # Judge 初期化
         judge = LLMJudge()
 
-        # テストケース生成
-        prompts, outputs_a, outputs_b, label_a, label_b = compare_configurations()
+        all_results = {}
 
-        # 評価実行
-        results = judge.evaluate_multiple(
+        # 1. 基本設定比較
+        print("\n📝 基本設定比較評価")
+        prompts, outputs_a, outputs_b, label_a, label_b, metrics_a, metrics_b = compare_configurations()
+
+        basic_eval = judge.evaluate_multiple(
             prompts=prompts,
             outputs_a=outputs_a,
             outputs_b=outputs_b,
             criteria="生成品質と正確性",
-            labels=(label_a, label_b)
+            labels=(label_a, label_b),
+            calculate_consistency=True
         )
 
-        # 結果表示
-        print("\n📊 LLM Judge 評価結果:")
-        print("=" * 50)
-        print(f"📝 比較数: {results['total_comparisons']}")
-        print(
-            f"🏆 {results['model_a_label']} 勝利: {results['model_a_wins']} ({results['model_a_win_rate']:.1%})")
-        print(
-            f"🏆 {results['model_b_label']} 勝利: {results['model_b_wins']} ({results['model_b_win_rate']:.1%})")
+        # 速度情報を追加
+        avg_speed_a = np.mean([m.get('tokens_per_second', 0)
+                              for m in metrics_a])
+        avg_speed_b = np.mean([m.get('tokens_per_second', 0)
+                              for m in metrics_b])
+        basic_eval["average_speed_a"] = avg_speed_a
+        basic_eval["average_speed_b"] = avg_speed_b
 
-        # 詳細結果の一部表示
-        print("\n🔍 詳細結果例:")
-        for i, result in enumerate(results['detailed_results'][:3]):
-            print(f"\n例 {i+1}:")
-            print(f"プロンプト: {result['prompt'][:80]}...")
-            print(f"勝者: {result['winner']}")
-            print(f"理由: {result['reasoning'][:150]}...")
+        all_results["basic_comparison"] = basic_eval
 
-        # 結果保存
-        with open('llm_judge_results.json', 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+        # 2. スケーリング係数比較（簡易版）
+        print("\n🔢 RoPE スケーリング比較評価")
+        try:
+            scaling_prompts, scaling_results = compare_scaling_factors()
 
-        print("\n💾 結果が llm_judge_results.json に保存されました")
+            # 16k vs 32k の比較例
+            if "16k設定" in scaling_results and "32k設定" in scaling_results:
+                scaling_eval = judge.evaluate_multiple(
+                    prompts=scaling_prompts,
+                    outputs_a=scaling_results["16k設定"].get("outputs", []),
+                    outputs_b=scaling_results["32k設定"].get("outputs", []),
+                    criteria="長文処理能力と品質",
+                    labels=("16k設定", "32k設定"),
+                    calculate_consistency=False  # 時間短縮のため
+                )
+                all_results["scaling_comparison"] = scaling_eval
 
-        return results
+            all_results["scaling_details"] = scaling_results
+
+        except Exception as e:
+            print(f"⚠️ スケーリング比較スキップ: {e}")
+
+        # 3. 結果表示
+        print("\n📊 包括的評価結果:")
+        print("=" * 60)
+
+        if "basic_comparison" in all_results:
+            basic = all_results["basic_comparison"]
+            print(f"📝 基本比較:")
+            print(
+                f"  {basic['model_a_label']}: {basic['model_a_win_rate']:.1%} 勝率 ({basic['average_speed_a']:.1f} tok/s)")
+            print(
+                f"  {basic['model_b_label']}: {basic['model_b_win_rate']:.1%} 勝率 ({basic['average_speed_b']:.1f} tok/s)")
+            if basic.get('j_score'):
+                print(f"  Judge Consistency: {basic['j_score']:.3f}")
+
+        if "scaling_comparison" in all_results:
+            scaling = all_results["scaling_comparison"]
+            print(f"\n🔢 スケーリング比較:")
+            print(
+                f"  {scaling['model_a_label']}: {scaling['model_a_win_rate']:.1%} 勝率")
+            print(
+                f"  {scaling['model_b_label']}: {scaling['model_b_win_rate']:.1%} 勝率")
+
+        # 4. 結果保存
+        output_file = 'comprehensive_evaluation_results.json'
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(all_results, f, ensure_ascii=False, indent=2)
+
+        print(f"\n💾 結果が {output_file} に保存されました")
+
+        return all_results
 
     except Exception as e:
         print(f"❌ 評価エラー: {e}")
@@ -323,21 +575,39 @@ def run_judge_evaluation():
         return None
 
 
+def run_judge_evaluation():
+    """従来のLLM Judge 評価（後方互換性のため残存）"""
+    return run_comprehensive_evaluation()
+
+
 def main():
     """メイン関数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='LLM-as-a-Judge 評価')
+    parser = argparse.ArgumentParser(
+        description='Fast-dLLM × LongLLaDA LLM-as-a-Judge 評価')
     parser.add_argument('--api-key', help='Google API キー')
-    parser.add_argument(
-        '--model', default='gemini-2.0-flash', help='Judgeモデル')
+    parser.add_argument('--model', default='gemini-2.0-flash', help='Judgeモデル')
+    parser.add_argument('--eval-type', choices=['basic', 'comprehensive', 'niah'],
+                        default='comprehensive', help='評価タイプ')
 
     args = parser.parse_args()
 
     if args.api_key:
         os.environ['GOOGLE_API_KEY'] = args.api_key
 
-    run_judge_evaluation()
+    if args.eval_type == 'comprehensive':
+        run_comprehensive_evaluation()
+    elif args.eval_type == 'basic':
+        run_judge_evaluation()
+    elif args.eval_type == 'niah':
+        # NAIHテストのみ実行
+        print("🔍 NIAH テスト単体実行")
+        model_path = 'GSAI-ML/LLaDA-8B-Instruct'
+        model, tokenizer, _ = load_model_with_scaling(
+            model_path, scaling_factor=14)
+        result = niah_test(model, tokenizer)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
