@@ -408,9 +408,12 @@ def compare_scaling_factors():
     return test_prompts, results
 
 
-def compare_configurations():
-    """READMEの設定に基づく異なる設定での生成結果を比較"""
-    print("🆚 設定比較実験（READMEベース）")
+def compare_vanilla_vs_fast_dllm():
+    """
+    単純なLongLLaDA vs LongLLaDA + Fast-dLLM の比較
+    研究の核心：Fast-dLLMの拡散生成機構の効果を検証
+    """
+    print("🆚 LongLLaDA vs LongLLaDA + Fast-dLLM 比較実験")
 
     # モデル読み込み
     model_path = 'GSAI-ML/LLaDA-8B-Instruct'
@@ -420,30 +423,12 @@ def compare_configurations():
     # テストプロンプト
     test_prompts = generate_test_cases()["basic"]
 
-    # READMEの設定A: 高速設定
-    config_a = {
-        "name": "高速設定",
-        "steps": 64,
-        "block_length": 64,  # READMEより大きなブロック
-        "remasking": "random",  # READMEの高速設定
-        "temperature": 0.0
-    }
+    outputs_vanilla = []  # 標準LongLLaDA
+    outputs_fast_dllm = []  # LongLLaDA + Fast-dLLM
+    metrics_vanilla = []
+    metrics_fast_dllm = []
 
-    # READMEの設定B: 品質重視設定
-    config_b = {
-        "name": "品質重視設定",
-        "steps": 256,  # READMEより多いステップ
-        "block_length": 16,  # READMEより小さなブロック
-        "remasking": "low_confidence",
-        "temperature": 0.0  # READMEで推奨
-    }
-
-    outputs_a = []
-    outputs_b = []
-    metrics_a = []
-    metrics_b = []
-
-    print(f"🔄 {len(test_prompts)} プロンプトで生成中...")
+    print(f"🔄 {len(test_prompts)} プロンプトで両方式生成中...")
 
     for prompt in tqdm(test_prompts):
         # フォーマット
@@ -454,25 +439,58 @@ def compare_configurations():
         input_ids = tokenizer(
             formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-        # 設定Aで生成
-        outputs_a_raw, nfe_a, metrics_a_raw = generate_fast_long(
-            model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_a
-        )
-        result_a = tokenizer.decode(
-            outputs_a_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
-        outputs_a.append(result_a)
-        metrics_a.append({"nfe": nfe_a, **metrics_a_raw})
+        # 1. 標準的なLongLLaDA生成（Hugging Faceの標準実装）
+        start_time = time.time()
+        with torch.no_grad():
+            vanilla_outputs = model.generate(
+                input_ids,
+                max_new_tokens=128,
+                do_sample=False,  # 決定的生成
+                temperature=1.0,
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=True
+            )
+        vanilla_time = time.time() - start_time
 
-        # 設定Bで生成
-        outputs_b_raw, nfe_b, metrics_b_raw = generate_fast_long(
-            model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_b
+        result_vanilla = tokenizer.decode(
+            vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=True
         )
-        result_b = tokenizer.decode(
-            outputs_b_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
-        outputs_b.append(result_b)
-        metrics_b.append({"nfe": nfe_b, **metrics_b_raw})
+        outputs_vanilla.append(result_vanilla)
 
-    return test_prompts, outputs_a, outputs_b, config_a["name"], config_b["name"], metrics_a, metrics_b
+        # 標準生成のメトリクス
+        vanilla_tokens = vanilla_outputs.shape[1] - input_ids.shape[1]
+        metrics_vanilla.append({
+            "generation_time": vanilla_time,
+            "tokens_generated": vanilla_tokens,
+            "tokens_per_second": vanilla_tokens / vanilla_time if vanilla_time > 0 else 0,
+            "method": "standard_generation"
+        })
+
+        # 2. LongLLaDA + Fast-dLLM（拡散生成機構）
+        outputs_fast_raw, nfe, metrics_fast = generate_fast_long(
+            model=model,
+            prompt=input_ids,
+            gen_length=128,
+            steps=128,  # 適度なステップ数
+            block_length=32,
+            temperature=0.0,
+            remasking='low_confidence',
+            dual_cache=True
+        )
+
+        result_fast = tokenizer.decode(
+            outputs_fast_raw[0, input_ids.shape[1]:], skip_special_tokens=True
+        )
+        outputs_fast_dllm.append(result_fast)
+
+        # Fast-dLLMのメトリクス
+        metrics_fast["nfe"] = nfe
+        metrics_fast["method"] = "fast_dllm_diffusion"
+        metrics_fast_dllm.append(metrics_fast)
+
+    return (test_prompts, outputs_vanilla, outputs_fast_dllm,
+            "標準LongLLaDA", "LongLLaDA+Fast-dLLM",
+            metrics_vanilla, metrics_fast_dllm)
 
 
 def run_comprehensive_evaluation():
@@ -492,9 +510,9 @@ def run_comprehensive_evaluation():
 
         all_results = {}
 
-        # 1. 基本設定比較
-        print("\n📝 基本設定比較評価")
-        prompts, outputs_a, outputs_b, label_a, label_b, metrics_a, metrics_b = compare_configurations()
+        # 1. LongLLaDA vs Fast-dLLM 比較
+        print("\n📝 LongLLaDA vs Fast-dLLM 比較評価")
+        prompts, outputs_a, outputs_b, label_a, label_b, metrics_a, metrics_b = compare_vanilla_vs_fast_dllm()
 
         basic_eval = judge.evaluate_multiple(
             prompts=prompts,
