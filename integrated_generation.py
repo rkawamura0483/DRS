@@ -18,33 +18,22 @@ import importlib.util
 # Flash Attentionのインストールチェックと自動インストール
 
 
-def check_and_install_flash_attention():
-    """Flash Attentionの確認と必要に応じたインストール"""
+def check_flash_attention():
+    """Flash Attentionの確認（インストールは手動で行う）"""
     try:
         import flash_attn
         print("✅ Flash Attention 利用可能")
         return True
     except ImportError:
-        print("⚠️ Flash Attention が見つかりません。インストールを試行中...")
-        try:
-            # Colabでのインストール
-            subprocess.run([
-                sys.executable, "-m", "pip", "install",
-                "flash-attn==2.3.3", "--no-build-isolation"
-            ], check=True, capture_output=True)
-
-            # インストール確認
-            import flash_attn
-            print("✅ Flash Attention インストール成功")
-            return True
-        except Exception as e:
-            print(f"⚠️ Flash Attention インストール失敗: {e}")
-            print("💡 Flash Attention無しでも動作しますが、速度が低下する可能性があります")
-            return False
+        print("⚠️ Flash Attention が見つかりません")
+        print("💡 Flash Attention無しでも動作しますが、速度が低下する可能性があります")
+        print("🔧 手動インストール方法（Colabの場合）:")
+        print("   !pip install flash-attn --no-build-isolation")
+        return False
 
 
-# Flash Attentionチェック
-check_and_install_flash_attention()
+# Flash Attentionチェック（インストールは手動で行う）
+has_flash_attention = check_flash_attention()
 
 # Fast-dLLMのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
