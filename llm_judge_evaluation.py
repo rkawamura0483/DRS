@@ -228,12 +228,12 @@ def generate_test_cases():
         "健康的な生活習慣について5つのアドバイスをください。",
     ]
 
-    # 長文処理テスト用プロンプト
+    # 長文処理テスト用プロンプト（メモリ制限を考慮して短縮）
     long_context_prompts = [
-        "次の長い物語の要約を書いてください：" + "昔々、ある村に勇敢な少年がいました。" * 100 + " この物語の主要なテーマは何ですか？",
-        "以下の技術文書の要点を整理してください：" + "機械学習は現代のAI技術の基盤です。" * 150 + " 最も重要なポイントを3つ挙げてください。",
+        "次の長い物語の要約を書いてください：" + "昔々、ある村に勇敢な少年がいました。" * 50 + " この物語の主要なテーマは何ですか？",
+        "以下の技術文書の要点を整理してください：" + "機械学習は現代のAI技術の基盤です。" * 75 + " 最も重要なポイントを3つ挙げてください。",
         "この長いコードの動作を説明してください：\n```python\n" + "# 重要な処理\nresult = process_data()\n" *
-        80 + "```\nこのコードの目的は何ですか？",
+        40 + "```\nこのコードの目的は何ですか？",
     ]
 
     return {
@@ -260,9 +260,17 @@ def niah_test(model, tokenizer, needle_info: str = "重要な情報：答えは4
     """
     print(f"🔍 NIAH テスト開始 (目標コンテキスト長: {context_length})")
 
-    # ダミーコンテキスト生成
+    # メモリ節約のため最大コンテキスト長を制限
+    max_safe_length = min(context_length, 8000)  # 8kトークンまでに制限
+
+    # ダミーコンテキスト生成（より効率的な方法）
     dummy_text = "これは重要ではない情報です。自然言語処理技術の発展により、大規模言語モデルが注目されています。"
-    haystack = (dummy_text + " ") * (context_length // len(dummy_text.split()))
+    dummy_tokens = tokenizer(
+        dummy_text, return_tensors='pt').input_ids.shape[1]
+
+    # 必要な繰り返し回数を計算（トークン数ベース）
+    repeat_count = max(1, max_safe_length // dummy_tokens // 2)  # 安全マージン
+    haystack = (dummy_text + " ") * repeat_count
 
     # needleを途中に埋め込み
     haystack_words = haystack.split()
@@ -271,24 +279,25 @@ def niah_test(model, tokenizer, needle_info: str = "重要な情報：答えは4
 
     full_context = " ".join(haystack_words) + f"\n\n質問：{question}\n回答："
 
-    # トークナイズ
+    # トークナイズして長さを確認
     input_ids = tokenizer(
-        full_context, return_tensors='pt').input_ids.to(model.device)
+        full_context, return_tensors='pt', truncation=True, max_length=max_safe_length
+    ).input_ids.to(model.device)
     actual_length = input_ids.shape[1]
 
-    print(f"📏 実際のコンテキスト長: {actual_length} トークン")
+    print(f"📏 実際のコンテキスト長: {actual_length} トークン (制限: {max_safe_length})")
 
     # 生成実行
     try:
         outputs, nfe, metrics = generate_fast_long(
             model=model,
             prompt=input_ids,
-            gen_length=128,
-            steps=64,
-            block_length=32,
+            gen_length=64,  # 生成長を短くしてメモリ節約
+            steps=32,       # ステップ数も削減
+            block_length=16,  # 小さなブロック
             temperature=0.0,
             remasking='low_confidence',
-            dual_cache=True
+            dual_cache=False  # デュアルキャッシュを無効化してメモリ節約
         )
 
         result = tokenizer.decode(
@@ -368,14 +377,14 @@ def compare_scaling_factors():
                 input_ids = tokenizer(
                     formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-                # 生成実行
+                # 生成実行（品質改善のためパラメータ調整）
                 output_ids, nfe, metrics = generate_fast_long(
                     model=model,
                     prompt=input_ids,
                     gen_length=256,
-                    steps=64,
-                    block_length=32,
-                    temperature=0.0,
+                    steps=128,  # ステップ数を増加して品質向上
+                    block_length=16,  # ブロック長を小さくして精度向上
+                    temperature=0.3,  # 適度な温度で自然な生成
                     remasking='low_confidence',
                     dual_cache=True
                 )
@@ -384,10 +393,11 @@ def compare_scaling_factors():
                     output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
                 outputs.append(result)
 
-            # NAIHテスト
-            niah_result = niah_test(model, tokenizer,
-                                    # 実用的な長さ
-                                    context_length=config["target_length"]//2)
+            # NAIHテスト（メモリ制限で実用的な長さに調整）
+            safe_context_length = min(
+                config["target_length"]//4, 4000)  # より安全な長さ
+            niah_result = niah_test(
+                model, tokenizer, context_length=safe_context_length)
             niah_results.append(niah_result)
 
             results[config["name"]] = {
@@ -397,9 +407,15 @@ def compare_scaling_factors():
                 "target_length": config["target_length"]
             }
 
-            # メモリクリア
-            del model
-            torch.cuda.empty_cache()
+            # 強制的なメモリクリア
+            del model, outputs, niah_results
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            import gc
+            gc.collect()
+
+            print(f"✅ {config['name']} 完了 - メモリクリア実行")
 
         except Exception as e:
             print(f"❌ {config['name']} エラー: {e}")
@@ -455,25 +471,54 @@ def compare_vanilla_vs_fast_dllm():
 
         # 1. 標準的なLongLLaDA生成（Hugging Faceの標準実装）
         start_time = time.time()
-        with torch.no_grad():
-            vanilla_outputs = model.generate(
-                input_ids,
-                max_new_tokens=128,
-                do_sample=False,  # 決定的生成
-                temperature=1.0,
-                pad_token_id=tokenizer.eos_token_id,
-                use_cache=True
-            )
-        vanilla_time = time.time() - start_time
+        try:
+            with torch.no_grad():
+                vanilla_outputs = model.generate(
+                    input_ids,
+                    max_new_tokens=128,
+                    do_sample=True,  # サンプリング生成
+                    temperature=0.7,  # 適度な温度
+                    top_p=0.9,       # nucleus sampling
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=True,
+                    repetition_penalty=1.1  # 繰り返し防止
+                )
+            vanilla_time = time.time() - start_time
 
-        # special_tokens をスキップすると <assistant> なども除去され何も残らない場合がある
-        result_vanilla = tokenizer.decode(
-            vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=False
-        ).replace("<|assistant|>", "").replace("<|endoftext|>", "").strip()
+            # 生成部分のみを抽出し、適切にデコード
+            generated_tokens = vanilla_outputs[0, input_ids.shape[1]:]
+            result_vanilla = tokenizer.decode(
+                generated_tokens, skip_special_tokens=True).strip()
+
+            # 空の場合は代替生成を試行
+            if not result_vanilla:
+                print("⚠️ 標準生成が空のため再試行中...")
+                vanilla_outputs = model.generate(
+                    input_ids,
+                    max_new_tokens=128,
+                    do_sample=False,  # greedy生成で再試行
+                    pad_token_id=tokenizer.eos_token_id,
+                    use_cache=True
+                )
+                generated_tokens = vanilla_outputs[0, input_ids.shape[1]:]
+                result_vanilla = tokenizer.decode(
+                    generated_tokens, skip_special_tokens=True).strip()
+
+        except Exception as e:
+            print(f"⚠️ 標準生成エラー: {e}")
+            result_vanilla = f"生成エラー: {str(e)}"
+            vanilla_time = time.time() - start_time
+            vanilla_tokens = 0  # エラー時はトークン数0
+
         outputs_vanilla.append(result_vanilla)
 
         # 標準生成のメトリクス
-        vanilla_tokens = vanilla_outputs.shape[1] - input_ids.shape[1]
+        if 'vanilla_outputs' in locals():
+            vanilla_tokens = vanilla_outputs.shape[1] - input_ids.shape[1]
+        else:
+            vanilla_tokens = 0  # エラー時はトークン数0
+
         metrics_vanilla.append({
             "generation_time": vanilla_time,
             "tokens_generated": vanilla_tokens,
@@ -482,26 +527,43 @@ def compare_vanilla_vs_fast_dllm():
         })
 
         # 2. LongLLaDA + Fast-dLLM（拡散生成機構）
-        outputs_fast_raw, nfe, metrics_fast = generate_fast_long(
-            model=model,
-            prompt=input_ids,
-            gen_length=128,
-            steps=128,  # 適度なステップ数
-            block_length=32,
-            temperature=0.0,
-            remasking='low_confidence',
-            dual_cache=True
-        )
+        try:
+            outputs_fast_raw, nfe, metrics_fast = generate_fast_long(
+                model=model,
+                prompt=input_ids,
+                gen_length=128,
+                steps=64,  # ステップ数を削減してメモリ節約
+                block_length=32,
+                temperature=0.0,
+                remasking='low_confidence',
+                dual_cache=True
+            )
 
-        result_fast = tokenizer.decode(
-            outputs_fast_raw[0, input_ids.shape[1]:], skip_special_tokens=True
-        )
+            result_fast = tokenizer.decode(
+                outputs_fast_raw[0, input_ids.shape[1]:], skip_special_tokens=True
+            ).strip()
+
+            # Fast-dLLMのメトリクス
+            metrics_fast["nfe"] = nfe
+            metrics_fast["method"] = "fast_dllm_diffusion"
+
+        except Exception as e:
+            print(f"⚠️ Fast-dLLM生成エラー: {e}")
+            result_fast = f"Fast-dLLM生成エラー: {str(e)}"
+            metrics_fast = {
+                "generation_time": 0,
+                "tokens_generated": 0,
+                "tokens_per_second": 0,
+                "nfe": 0,
+                "method": "fast_dllm_diffusion"
+            }
+
         outputs_fast_dllm.append(result_fast)
-
-        # Fast-dLLMのメトリクス
-        metrics_fast["nfe"] = nfe
-        metrics_fast["method"] = "fast_dllm_diffusion"
         metrics_fast_dllm.append(metrics_fast)
+
+        # 各プロンプトごとにメモリクリア
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return (test_prompts, outputs_vanilla, outputs_fast_dllm,
             "標準LongLLaDA", "LongLLaDA+Fast-dLLM",
@@ -528,6 +590,16 @@ def run_comprehensive_evaluation():
         # 1. LongLLaDA vs Fast-dLLM 比較
         print("\n📝 LongLLaDA vs Fast-dLLM 比較評価")
         prompts, outputs_a, outputs_b, label_a, label_b, metrics_a, metrics_b = compare_vanilla_vs_fast_dllm()
+
+        # メモリクリア
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(f"📋 比較対象: {len(outputs_a)} 件のプロンプト")
+        print(
+            f"📊 A（{label_a}）の空出力数: {sum(1 for x in outputs_a if not x.strip())}")
+        print(
+            f"📊 B（{label_b}）の空出力数: {sum(1 for x in outputs_b if not x.strip())}")
 
         basic_eval = judge.evaluate_multiple(
             prompts=prompts,
@@ -599,12 +671,24 @@ def run_comprehensive_evaluation():
 
         print(f"\n💾 結果が {output_file} に保存されました")
 
+        # 最終メモリクリア
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        import gc
+        gc.collect()
+
         return all_results
 
     except Exception as e:
         print(f"❌ 評価エラー: {e}")
         import traceback
         traceback.print_exc()
+
+        # エラー時もメモリクリア
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return None
 
 
