@@ -689,6 +689,14 @@ def load_model_with_scaling(model_path, scaling_factor=1, device='auto'):
     # 設定読み込み
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
+    # Fast-dLLM互換性パッチ： 'train_max_sequence_length' がない場合、追加する
+    if not hasattr(config, 'train_max_sequence_length'):
+        print("🔧 'train_max_sequence_length' がコンフィグにないので追加します。")
+        # 'max_sequence_length'からコピーするか、デフォルト値を設定
+        seq_len = getattr(config, 'max_sequence_length', 1024)
+        config.train_max_sequence_length = seq_len
+        print(f"   -> train_max_sequence_length を {seq_len} に設定")
+
     # RoPEスケーリング適用
     if scaling_factor > 1:
         original_theta = getattr(config, 'rope_theta', 10000.0)
