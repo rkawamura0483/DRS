@@ -16,14 +16,22 @@ import os
 current_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(current_dir, 'Fast-dLLM',
                           'Fast-dLLM', 'llada', 'model')
+generate_path = os.path.join(current_dir, 'Fast-dLLM', 'Fast-dLLM', 'llada')
 sys.path.insert(0, model_path)
+sys.path.insert(0, generate_path)
 
 try:
     from modeling_llada import LLaDAModelLM
-except ImportError:
+    from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+    print("✅ Fast-dLLMの正しい実装を読み込みました")
+except ImportError as e:
+    print(f"⚠️  Fast-dLLMの実装が見つかりません: {e}")
     # フォールバック: Hugging Face Hub のAutoModelForCausalLMを使用
-    print("⚠️  LLaDAModelLM が見つかりません。AutoModelForCausalLMを使用します。")
+    print("⚠️  AutoModelForCausalLMを使用します（キャッシュ機能制限あり）")
     LLaDAModelLM = AutoModelForCausalLM
+    generate = None
+    generate_with_prefix_cache = None
+    generate_with_dual_cache = None
 
 
 def add_gumbel_noise(logits, temperature):
@@ -121,104 +129,36 @@ def generate_fast_long_dual_cache(model, prompt, steps=128, gen_length=128, bloc
         model.config.rope_theta = original_theta * scaling_factor
         print(f"🔧 RoPE θ スケーリング: {original_theta} → {model.config.rope_theta}")
 
-    # 初期化
-    x = torch.full((1, prompt.shape[1] + gen_length),
-                   mask_id, dtype=torch.long).to(device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
-
-    nfe = 0
-    total_tokens_generated = 0
-    cache_hits = 0
-
-    print(
-        f"📦 ブロック数: {num_blocks}, ブロック長: {block_length}, ブロック毎ステップ: {steps_per_block}")
-
-    # ブロック単位生成（Fast-dLLMのデュアルキャッシュ実装）
-    for num_block in range(num_blocks):
-        current_block_start = prompt.shape[1] + num_block * block_length
-        current_block_end = current_block_start + block_length
-
-        print(f"🔄 ブロック {num_block + 1}/{num_blocks} 処理中...")
-
-        block_mask_index = (
-            x[:, current_block_start:current_block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(
-            block_mask_index, steps_per_block)
-
-        # Fast-dLLMのデュアルキャッシュ初期化
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-        mask_index = (x == mask_id)
-        mask_index[:, current_block_end:] = 0
-
-        x0, transfer_index = get_transfer_index(
-            output.logits, temperature, remasking, mask_index, x,
-            num_transfer_tokens[:, 0] if threshold is None else None, threshold
+    # Fast-dLLMの正しい実装が利用可能な場合はそれを使用
+    if generate_with_dual_cache is not None:
+        print("🚀 Fast-dLLMの正しいデュアルキャッシュ実装を使用")
+        outputs, nfe = generate_with_dual_cache(
+            model, prompt, steps=steps, gen_length=gen_length, block_length=block_length,
+            temperature=temperature, remasking=remasking, mask_id=mask_id, threshold=threshold
         )
-        x[transfer_index] = x0[transfer_index]
-        nfe += 1
-        total_tokens_generated += transfer_index.sum().item()
 
-        # ブロック内反復（デュアルキャッシュ使用）
-        i = 1
-        replace_position = torch.zeros_like(x, dtype=torch.bool)
-        replace_position[:, current_block_start:current_block_end] = 1
+        # RoPEスケーリングを元に戻す
+        if original_theta is not None:
+            model.config.rope_theta = original_theta
 
-        while True:
-            nfe += 1
-            mask_index = (
-                x[:, current_block_start:current_block_end] == mask_id)
+        total_time = time.time() - start_time
+        metrics = {
+            'total_time': total_time,
+            'tokens_per_second': gen_length / total_time if total_time > 0 else 0,
+            'nfe': nfe,
+            'cache_hits': nfe - 1,  # 推定値
+            'total_tokens_generated': gen_length,
+            'blocks_processed': gen_length // block_length,
+            'scaling_factor_used': scaling_factor
+        }
+        return outputs, nfe, metrics
 
-            if mask_index.sum() == 0:
-                break
-
-            # デュアルキャッシュを使用した部分生成
-            logits = model(
-                x[:, current_block_start:current_block_end],
-                past_key_values=past_key_values,
-                use_cache=True,
-                replace_position=replace_position
-            ).logits
-            cache_hits += 1
-
-            x0, transfer_index = get_transfer_index(
-                logits, temperature, remasking, mask_index,
-                x[:, current_block_start:current_block_end],
-                num_transfer_tokens[:, min(
-                    i, steps_per_block-1)] if threshold is None else None,
-                threshold
-            )
-            x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
-            total_tokens_generated += transfer_index.sum().item()
-            i += 1
-
-            if i >= steps_per_block:
-                break
-
-    # RoPEスケーリングを元に戻す
-    if original_theta is not None:
-        model.config.rope_theta = original_theta
-
-    total_time = time.time() - start_time
-
-    # メトリクス計算
-    metrics = {
-        'total_time': total_time,
-        'tokens_per_second': total_tokens_generated / total_time if total_time > 0 else 0,
-        'nfe': nfe,
-        'cache_hits': cache_hits,
-        'total_tokens_generated': total_tokens_generated,
-        'blocks_processed': num_blocks,
-        'scaling_factor_used': scaling_factor
-    }
-
-    return x, nfe, metrics
+    # フォールバック: キャッシュなし実装
+    print("⚠️  デュアルキャッシュ利用不可、キャッシュなし実装を使用")
+    return generate_no_cache(
+        model, prompt, steps, gen_length, block_length,
+        temperature, remasking, mask_id, threshold, scaling_factor
+    )
 
 
 @torch.no_grad()
@@ -229,7 +169,6 @@ def generate_fast_long_prefix_cache(model, prompt, steps=128, gen_length=128, bl
     Fast-dLLM × LongLLaDA 統合生成関数（プレフィックスキャッシュ使用）
     """
     start_time = time.time()
-    device = model.device
 
     # RoPEスケーリング適用
     original_theta = None
@@ -238,108 +177,36 @@ def generate_fast_long_prefix_cache(model, prompt, steps=128, gen_length=128, bl
         model.config.rope_theta = original_theta * scaling_factor
         print(f"🔧 RoPE θ スケーリング: {original_theta} → {model.config.rope_theta}")
 
-    # 初期化
-    x = torch.full((1, prompt.shape[1] + gen_length),
-                   mask_id, dtype=torch.long).to(device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    assert gen_length % block_length == 0
-    num_blocks = gen_length // block_length
-    assert steps % num_blocks == 0
-    steps_per_block = steps // num_blocks
-
-    nfe = 0
-    total_tokens_generated = 0
-    cache_hits = 0
-
-    print(
-        f"📦 ブロック数: {num_blocks}, ブロック長: {block_length}, ブロック毎ステップ: {steps_per_block}")
-
-    # ブロック単位生成（Fast-dLLMのプレフィックスキャッシュ実装）
-    for num_block in range(num_blocks):
-        current_block_start = prompt.shape[1] + num_block * block_length
-        current_block_end = current_block_start + block_length
-
-        print(f"🔄 ブロック {num_block + 1}/{num_blocks} 処理中...")
-
-        block_mask_index = (
-            x[:, current_block_start:current_block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(
-            block_mask_index, steps_per_block)
-
-        # プレフィックスキャッシュ初期化
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-
-        mask_index = (x == mask_id)
-        mask_index[:, current_block_end:] = 0
-        x0, transfer_index = get_transfer_index(
-            output.logits, temperature, remasking, mask_index, x,
-            num_transfer_tokens[:, 0] if threshold is None else None, threshold
+    # Fast-dLLMの正しい実装が利用可能な場合はそれを使用
+    if generate_with_prefix_cache is not None:
+        print("🚀 Fast-dLLMの正しいプレフィックスキャッシュ実装を使用")
+        outputs, nfe = generate_with_prefix_cache(
+            model, prompt, steps=steps, gen_length=gen_length, block_length=block_length,
+            temperature=temperature, remasking=remasking, mask_id=mask_id, threshold=threshold
         )
-        x[transfer_index] = x0[transfer_index]
-        total_tokens_generated += transfer_index.sum().item()
 
-        # プレフィックス部分のキャッシュのみ保持
-        new_past_key_values = []
-        for i in range(len(past_key_values)):
-            new_past_key_values.append(())
-            for j in range(len(past_key_values[i])):
-                new_past_key_values[i] += (past_key_values[i]
-                                           [j][:, :, :current_block_start],)
+        # RoPEスケーリングを元に戻す
+        if original_theta is not None:
+            model.config.rope_theta = original_theta
 
-        past_key_values = new_past_key_values
-        nfe += 1
+        total_time = time.time() - start_time
+        metrics = {
+            'total_time': total_time,
+            'tokens_per_second': gen_length / total_time if total_time > 0 else 0,
+            'nfe': nfe,
+            'cache_hits': nfe - 1,  # 推定値
+            'total_tokens_generated': gen_length,
+            'blocks_processed': gen_length // block_length,
+            'scaling_factor_used': scaling_factor
+        }
+        return outputs, nfe, metrics
 
-        # ブロック内反復
-        i = 1
-        while True:
-            nfe += 1
-            mask_index = (x[:, current_block_start:] == mask_id)
-            mask_index[:, block_length:] = 0
-
-            if mask_index.sum() == 0:
-                break
-
-            logits = model(
-                x[:, current_block_start:],
-                past_key_values=past_key_values,
-                use_cache=True
-            ).logits
-            cache_hits += 1
-
-            x0, transfer_index = get_transfer_index(
-                logits, temperature, remasking, mask_index,
-                x[:, current_block_start:],
-                num_transfer_tokens[:, min(
-                    i, steps_per_block-1)] if threshold is None else None,
-                threshold
-            )
-            x[:, current_block_start:][transfer_index] = x0[transfer_index]
-            total_tokens_generated += transfer_index.sum().item()
-
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
-                break
-            i += 1
-
-    # RoPEスケーリングを元に戻す
-    if original_theta is not None:
-        model.config.rope_theta = original_theta
-
-    total_time = time.time() - start_time
-
-    # メトリクス計算
-    metrics = {
-        'total_time': total_time,
-        'tokens_per_second': total_tokens_generated / total_time if total_time > 0 else 0,
-        'nfe': nfe,
-        'cache_hits': cache_hits,
-        'total_tokens_generated': total_tokens_generated,
-        'blocks_processed': num_blocks,
-        'scaling_factor_used': scaling_factor
-    }
-
-    return x, nfe, metrics
+    # フォールバック: キャッシュなし実装
+    print("⚠️  プレフィックスキャッシュ利用不可、キャッシュなし実装を使用")
+    return generate_no_cache(
+        model, prompt, steps, gen_length, block_length,
+        temperature, remasking, mask_id, threshold, scaling_factor
+    )
 
 
 def generate_fast_long(model, prompt, steps=128, gen_length=128, block_length=32,
@@ -348,23 +215,27 @@ def generate_fast_long(model, prompt, steps=128, gen_length=128, block_length=32
     """
     統合生成関数（キャッシュ方式を選択可能）
     """
-    if use_cache:
-        if dual_cache:
+    # Fast-dLLMの正しい実装が利用可能な場合はそれを優先使用
+    if use_cache and generate is not None:
+        if dual_cache and generate_with_dual_cache is not None:
+            print("🎯 Fast-dLLM デュアルキャッシュ実装を使用")
             return generate_fast_long_dual_cache(
                 model, prompt, steps, gen_length, block_length,
                 temperature, remasking, mask_id, threshold, scaling_factor
             )
-        else:
+        elif generate_with_prefix_cache is not None:
+            print("🎯 Fast-dLLM プレフィックスキャッシュ実装を使用")
             return generate_fast_long_prefix_cache(
                 model, prompt, steps, gen_length, block_length,
                 temperature, remasking, mask_id, threshold, scaling_factor
             )
-    else:
-        # キャッシュなし実装（標準のFast-dLLM generate関数）
-        return generate_no_cache(
-            model, prompt, steps, gen_length, block_length,
-            temperature, remasking, mask_id, threshold, scaling_factor
-        )
+
+    # フォールバック: キャッシュなし実装（最も安全）
+    print("🎯 キャッシュなし実装を使用（安全モード）")
+    return generate_no_cache(
+        model, prompt, steps, gen_length, block_length,
+        temperature, remasking, mask_id, threshold, scaling_factor
+    )
 
 
 @torch.no_grad()
@@ -381,6 +252,34 @@ def generate_no_cache(model, prompt, steps=128, gen_length=128, block_length=32,
     if scaling_factor > 1 and hasattr(model.config, 'rope_theta'):
         original_theta = model.config.rope_theta
         model.config.rope_theta = original_theta * scaling_factor
+        print(f"🔧 RoPE θ スケーリング: {original_theta} → {model.config.rope_theta}")
+
+    # Fast-dLLMの正しい実装が利用可能な場合はそれを使用
+    if generate is not None:
+        print("🚀 Fast-dLLMの正しいキャッシュなし実装を使用")
+        outputs, nfe = generate(
+            model, prompt, steps=steps, gen_length=gen_length, block_length=block_length,
+            temperature=temperature, remasking=remasking, mask_id=mask_id, threshold=threshold
+        )
+
+        # RoPEスケーリングを元に戻す
+        if original_theta is not None:
+            model.config.rope_theta = original_theta
+
+        total_time = time.time() - start_time
+        metrics = {
+            'total_time': total_time,
+            'tokens_per_second': gen_length / total_time if total_time > 0 else 0,
+            'nfe': nfe,
+            'cache_hits': 0,
+            'total_tokens_generated': gen_length,
+            'blocks_processed': gen_length // block_length,
+            'scaling_factor_used': scaling_factor
+        }
+        return outputs, nfe, metrics
+
+    # フォールバック: 独自実装（キャッシュなし）
+    print("⚠️  Fast-dLLM実装利用不可、独自キャッシュなし実装を使用")
 
     x = torch.full((1, prompt.shape[1] + gen_length),
                    mask_id, dtype=torch.long).to(model.device)
