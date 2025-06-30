@@ -11,11 +11,59 @@ from typing import Optional, Tuple, List
 import time
 import sys
 import os
+import glob
 
 # Fast-dLLMのパスを追加
-current_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model')
-generate_path = os.path.join(current_dir, 'Fast-dLLM', 'llada')
+print(f"🔍 現在のディレクトリ: {os.path.dirname(os.path.abspath(__file__))}")
+
+# Colab環境での診断
+possible_paths = [
+    # 現在のディレクトリからの相対パス
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'Fast-dLLM', 'llada', 'model'),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'Fast-dLLM', 'llada'),
+    # 直接のFast-dLLMディレクトリ
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Fast-dLLM'),
+    # 親ディレクトリからの検索
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'Fast-dLLM', 'llada', 'model'),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'Fast-dLLM', 'llada'),
+]
+
+print("📁 ディレクトリ診断:")
+for path in possible_paths:
+    exists = os.path.exists(path)
+    print(f"  {path}: {'✅' if exists else '❌'}")
+    if exists and os.path.isdir(path):
+        try:
+            contents = os.listdir(path)[:5]  # 最初の5項目のみ
+            print(f"    内容: {contents}")
+        except:
+            pass
+
+# modeling_llada.pyファイルを探す
+print("\n🔍 modeling_llada.py を検索中...")
+for root, dirs, files in os.walk(os.path.dirname(os.path.abspath(__file__))):
+    if 'modeling_llada.py' in files:
+        print(f"✅ 見つかりました: {root}")
+        model_path = root
+        generate_path = os.path.dirname(
+            root) if root.endswith('model') else root
+        break
+else:
+    # フォールバック: project layout情報から推測
+    print("🔍 プロジェクトレイアウトから推測...")
+    model_path = os.path.join(os.path.dirname(os.path.abspath(
+        __file__)), 'Fast-dLLM', 'Fast-dLLM', 'llada', 'model')
+    generate_path = os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), 'Fast-dLLM', 'Fast-dLLM', 'llada')
+
+print(f"📍 使用するパス:")
+print(f"  - モデルパス: {model_path}")
+print(f"  - 生成パス: {generate_path}")
+
 sys.path.insert(0, model_path)
 sys.path.insert(0, generate_path)
 
@@ -25,11 +73,6 @@ try:
     print("✅ Fast-dLLMの正しい実装を読み込みました")
 except ImportError as e:
     print(f"⚠️  Fast-dLLMの実装が見つかりません: {e}")
-    print(f"📁 パス確認:")
-    print(f"  - モデルパス: {model_path}")
-    print(f"  - 生成パス: {generate_path}")
-    print(f"  - モデルパス存在: {os.path.exists(model_path)}")
-    print(f"  - 生成パス存在: {os.path.exists(generate_path)}")
     # フォールバック: Hugging Face Hub のAutoModelForCausalLMを使用
     print("⚠️  AutoModelForCausalLMを使用します（キャッシュ機能制限あり）")
     LLaDAModelLM = AutoModelForCausalLM
