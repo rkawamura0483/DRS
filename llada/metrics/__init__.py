@@ -20,7 +20,7 @@ Generative Trajectory Stability (GTS) メトリクスモジュール
 diffusion LLMの生成軌跡の安定性を測定するための各種メトリクスを提供します。
 """
 
-from .gts import BaseGTSMetric, BasicGTS, SemanticGTS
+from .gts import BaseGTSMetric, BasicGTS, SemanticGTS, create_gts_metric, evaluate_trajectory_stability
 
 # ProbabilisticGTSは条件付きimport
 try:
@@ -29,11 +29,15 @@ try:
         'BaseGTSMetric',
         'BasicGTS',
         'SemanticGTS',
-        'ProbabilisticGTS'
+        'ProbabilisticGTS',
+        'create_gts_metric',
+        'evaluate_trajectory_stability'
     ]
 except (ImportError, ValueError):
     __all__ = [
         'BaseGTSMetric',
         'BasicGTS',
-        'SemanticGTS'
+        'SemanticGTS',
+        'create_gts_metric',
+        'evaluate_trajectory_stability'
     ]
