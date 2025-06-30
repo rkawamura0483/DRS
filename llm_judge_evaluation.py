@@ -431,26 +431,31 @@ def compare_vanilla_vs_fast_dllm():
     """
     print("🆚 LongLLaDA vs LongLLaDA + Fast-dLLM 比較実験")
 
-    # LongLLaDAの正しい読み込み方法（AutoModelを使用）
-    from transformers import AutoModel, AutoTokenizer, AutoConfig
-
     model_path = 'GSAI-ML/LLaDA-8B-Instruct'
 
-    # LongLLaDAの正しい読み込み
-    print("📥 LongLLaDAモデル読み込み（AutoModel使用）...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
+    # 標準LongLLaDA用: AutoModel（オリジナル拡散生成用）
+    print("📥 標準LongLLaDAモデル読み込み（AutoModel）...")
+    from transformers import AutoModel, AutoTokenizer, AutoConfig
+
+    config_vanilla = AutoConfig.from_pretrained(
+        model_path, trust_remote_code=True)
+    model_vanilla = AutoModel.from_pretrained(
         model_path,
-        config=config,
+        config=config_vanilla,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,  # LongLLaDAの推奨データ型
+        torch_dtype=torch.bfloat16,
         device_map='auto'
     ).eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=True)
+    # Fast-dLLM用: LLaDAModelLM（デュアルキャッシュ対応）
+    print("📥 Fast-dLLM LLaDAModelLM読み込み（デュアルキャッシュ対応）...")
+    model_fast, tokenizer, config_fast = load_model_with_scaling(
+        model_path, scaling_factor=1, device='auto'
+    )
 
-    print("✅ LongLLaDAモデル読み込み完了")
+    print("✅ 両モデル読み込み完了")
+    print(f"   - 標準LongLLaDA: {type(model_vanilla).__name__}")
+    print(f"   - Fast-dLLM: {type(model_fast).__name__}")
 
     # テストプロンプト
     test_prompts = generate_test_cases()["basic"]
@@ -469,7 +474,7 @@ def compare_vanilla_vs_fast_dllm():
             messages, add_generation_prompt=True, tokenize=False
         )
         input_ids = tokenizer(
-            formatted_prompt, return_tensors='pt').input_ids.to(model.device)
+            formatted_prompt, return_tensors='pt').input_ids.to(model_vanilla.device)
 
         # 1. 標準的なLongLLaDA生成（LongLLaDAオリジナルの拡散生成）
         start_time = time.time()
@@ -478,7 +483,7 @@ def compare_vanilla_vs_fast_dllm():
             from LongLLaDA.llada.llada_generate import generate as llada_generate
 
             vanilla_outputs = llada_generate(
-                model=model,
+                model=model_vanilla,
                 prompt=input_ids,
                 steps=128,  # LongLLaDAの標準設定
                 gen_length=128,  # 生成長
@@ -505,7 +510,7 @@ def compare_vanilla_vs_fast_dllm():
             try:
                 # より基本的なパラメータで再試行
                 vanilla_outputs = llada_generate(
-                    model=model,
+                    model=model_vanilla,
                     prompt=input_ids,
                     steps=64,  # ステップ数削減
                     gen_length=64,  # 生成長削減
@@ -542,7 +547,7 @@ def compare_vanilla_vs_fast_dllm():
         # 2. LongLLaDA + Fast-dLLM（拡散生成機構）
         try:
             outputs_fast_raw, nfe, metrics_fast = generate_fast_long(
-                model=model,
+                model=model_fast,
                 prompt=input_ids,
                 gen_length=128,
                 steps=64,  # ステップ数を削減してメモリ節約
@@ -553,7 +558,8 @@ def compare_vanilla_vs_fast_dllm():
             )
 
             result_fast = tokenizer.decode(
-                outputs_fast_raw[0, input_ids.shape[1]                                 :], skip_special_tokens=True
+                outputs_fast_raw[0, input_ids.shape[1]
+                    :], skip_special_tokens=True
             ).strip()
 
             # Fast-dLLMのメトリクス
