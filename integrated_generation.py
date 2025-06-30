@@ -15,6 +15,37 @@ import glob
 import subprocess
 import importlib.util
 
+# Flash Attentionのインストールチェックと自動インストール
+
+
+def check_and_install_flash_attention():
+    """Flash Attentionの確認と必要に応じたインストール"""
+    try:
+        import flash_attn
+        print("✅ Flash Attention 利用可能")
+        return True
+    except ImportError:
+        print("⚠️ Flash Attention が見つかりません。インストールを試行中...")
+        try:
+            # Colabでのインストール
+            subprocess.run([
+                sys.executable, "-m", "pip", "install",
+                "flash-attn==2.3.3", "--no-build-isolation"
+            ], check=True, capture_output=True)
+
+            # インストール確認
+            import flash_attn
+            print("✅ Flash Attention インストール成功")
+            return True
+        except Exception as e:
+            print(f"⚠️ Flash Attention インストール失敗: {e}")
+            print("💡 Flash Attention無しでも動作しますが、速度が低下する可能性があります")
+            return False
+
+
+# Flash Attentionチェック
+check_and_install_flash_attention()
+
 # Fast-dLLMのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
 print(f"🔍 現在のディレクトリ: {current_dir}")
@@ -64,110 +95,177 @@ generate = None
 generate_with_prefix_cache = None
 generate_with_dual_cache = None
 
-# 複数のパスを試行
-fast_dllm_paths = [
-    os.path.join(current_dir, 'Fast-dLLM', 'llada'),
-    os.path.join(current_dir, 'Fast-dLLM', 'llada', 'model'),
-    './Fast-dLLM/llada',
-    './Fast-dLLM/llada/model',
-    'Fast-dLLM/llada',
-    'Fast-dLLM/llada/model'
-]
-
-for path in fast_dllm_paths:
-    if os.path.exists(path):
-        print(f"✅ Fast-dLLMパスを発見: {path}")
-        sys.path.insert(0, path)
-
-        # モデルディレクトリも追加
-        model_path = os.path.join(
-            path, 'model') if not path.endswith('model') else path
-        if os.path.exists(model_path):
-            sys.path.insert(0, model_path)
-            print(f"✅ モデルパスを追加: {model_path}")
+# Fast-dLLMディレクトリを探す
+fast_dllm_root = None
+for possible_path in [
+    os.path.join(current_dir, 'Fast-dLLM'),
+    './Fast-dLLM',
+    'Fast-dLLM'
+]:
+    if os.path.exists(possible_path) and os.path.exists(os.path.join(possible_path, 'llada')):
+        fast_dllm_root = os.path.abspath(possible_path)
+        print(f"✅ Fast-dLLMルートディレクトリを発見: {fast_dllm_root}")
         break
 
-# インポートを安全に実行
-try:
-    # まず相対インポートの問題を回避するため、必要なモジュールを個別に処理
+if fast_dllm_root:
+    # Fast-dLLMをPythonパッケージとして認識させる
+    sys.path.insert(0, fast_dllm_root)
 
-    # modeling_llada.pyの直接読み込み
-    model_file_paths = [
-        os.path.join(current_dir, 'Fast-dLLM', 'llada',
-                     'model', 'modeling_llada.py'),
-        './Fast-dLLM/llada/model/modeling_llada.py',
-        'Fast-dLLM/llada/model/modeling_llada.py'
-    ]
+    # llada以下をパッケージとして認識させる
+    llada_path = os.path.join(fast_dllm_root, 'llada')
+    model_path = os.path.join(llada_path, 'model')
 
-    for model_file in model_file_paths:
-        if os.path.exists(model_file):
-            print(f"📂 modeling_llada.py を発見: {model_file}")
+    if os.path.exists(llada_path):
+        sys.path.insert(0, llada_path)
+        print(f"✅ lladaパッケージパスを追加: {llada_path}")
 
-            # configuration_llada.pyも同時に読み込み
-            config_file = os.path.join(os.path.dirname(
-                model_file), 'configuration_llada.py')
-            if os.path.exists(config_file):
-                print(f"📂 configuration_llada.py を発見: {config_file}")
+    if os.path.exists(model_path):
+        sys.path.insert(0, model_path)
+        print(f"✅ modelパッケージパスを追加: {model_path}")
 
-                # 設定モジュールを先に読み込み
-                spec_config = importlib.util.spec_from_file_location(
-                    "configuration_llada", config_file)
-                config_module = importlib.util.module_from_spec(spec_config)
-                sys.modules["configuration_llada"] = config_module
-                spec_config.loader.exec_module(config_module)
+    try:
+        # __init__.pyファイルを作成してパッケージ認識を確実にする
+        init_files = [
+            os.path.join(fast_dllm_root, '__init__.py'),
+            os.path.join(llada_path, '__init__.py'),
+            os.path.join(model_path, '__init__.py')
+        ]
 
-                # モデルモジュールを読み込み
-                spec_model = importlib.util.spec_from_file_location(
-                    "modeling_llada", model_file)
-                model_module = importlib.util.module_from_spec(spec_model)
+        for init_file in init_files:
+            if not os.path.exists(init_file):
+                with open(init_file, 'w') as f:
+                    f.write(
+                        '# Auto-generated __init__.py for package recognition\n')
+                print(f"📝 __init__.pyを作成: {init_file}")
 
-                # 相対インポートを解決するために設定モジュールを注入
-                model_module.configuration_llada = config_module
+        # パッケージ構造を正しく設定してインポート
+        print("🔄 Fast-dLLMパッケージをインポート中...")
 
-                sys.modules["modeling_llada"] = model_module
-                spec_model.loader.exec_module(model_module)
+        # まずllada.modelパッケージをインポート
+        import llada.model.configuration_llada as config_module
+        print("✅ configuration_llada インポート成功")
 
-                LLaDAModelLM = model_module.LLaDAModelLM
-                print("✅ LLaDAModelLM を正常に読み込みました")
-                break
+        import llada.model.modeling_llada as model_module
+        print("✅ modeling_llada インポート成功")
 
-    # generate.pyの読み込み
-    generate_file_paths = [
-        os.path.join(current_dir, 'Fast-dLLM', 'llada', 'generate.py'),
-        './Fast-dLLM/llada/generate.py',
-        'Fast-dLLM/llada/generate.py'
-    ]
+        # LLaDAModelLMクラスを取得
+        LLaDAModelLM = model_module.LLaDAModelLM
+        print("✅ LLaDAModelLM クラス取得成功")
 
-    for generate_file in generate_file_paths:
-        if os.path.exists(generate_file):
-            print(f"📂 generate.py を発見: {generate_file}")
+        # generate.pyをインポート
+        import llada.generate as generate_module
+        print("✅ generate モジュール インポート成功")
 
+        # 生成関数を取得
+        generate = generate_module.generate
+        generate_with_prefix_cache = generate_module.generate_with_prefix_cache
+        generate_with_dual_cache = generate_module.generate_with_dual_cache
+
+        print("✅ Fast-dLLMの全ての実装を正常に読み込みました")
+
+    except ImportError as e:
+        print(f"⚠️ パッケージインポートに失敗: {e}")
+
+        # より詳細なエラー診断
+        print("🔍 詳細診断を実行中...")
+
+        # 必要ファイルの存在チェック
+        required_files = [
+            os.path.join(model_path, 'configuration_llada.py'),
+            os.path.join(model_path, 'modeling_llada.py'),
+            os.path.join(llada_path, 'generate.py')
+        ]
+
+        for file_path in required_files:
+            if os.path.exists(file_path):
+                print(f"✅ {os.path.basename(file_path)} 存在確認")
+            else:
+                print(f"❌ {os.path.basename(file_path)} が見つかりません: {file_path}")
+
+        # システムパス確認
+        print("📋 現在のsys.path:")
+        for i, path in enumerate(sys.path[:10]):  # 最初の10個のみ表示
+            print(f"  {i}: {path}")
+
+        # 代替方法: 直接実行でインポート
+        try:
+            print("🔄 代替方法でインポートを試行...")
+
+            # 現在のディレクトリを一時的に変更
+            original_cwd = os.getcwd()
+            os.chdir(fast_dllm_root)
+
+            # パッケージとして再インポート
+            import importlib
+            import sys
+
+            # モジュールをリフレッシュ
+            if 'llada.model.configuration_llada' in sys.modules:
+                del sys.modules['llada.model.configuration_llada']
+            if 'llada.model.modeling_llada' in sys.modules:
+                del sys.modules['llada.model.modeling_llada']
+            if 'llada.generate' in sys.modules:
+                del sys.modules['llada.generate']
+
+            # 設定モジュール
+            spec_config = importlib.util.spec_from_file_location(
+                'llada.model.configuration_llada',
+                os.path.join(llada_path, 'model', 'configuration_llada.py')
+            )
+            config_module = importlib.util.module_from_spec(spec_config)
+            sys.modules['llada.model.configuration_llada'] = config_module
+            spec_config.loader.exec_module(config_module)
+
+            # モデルモジュール
+            spec_model = importlib.util.spec_from_file_location(
+                'llada.model.modeling_llada',
+                os.path.join(llada_path, 'model', 'modeling_llada.py')
+            )
+            model_module = importlib.util.module_from_spec(spec_model)
+
+            # 相対インポートを解決するために必要なモジュールを注入
+            model_module.__dict__['configuration_llada'] = config_module
+
+            sys.modules['llada.model.modeling_llada'] = model_module
+            spec_model.loader.exec_module(model_module)
+
+            LLaDAModelLM = model_module.LLaDAModelLM
+
+            # 生成モジュール
             spec_generate = importlib.util.spec_from_file_location(
-                "generate", generate_file)
+                'llada.generate',
+                os.path.join(llada_path, 'generate.py')
+            )
             generate_module = importlib.util.module_from_spec(spec_generate)
 
-            # modeling_lladaモジュールを注入
-            if LLaDAModelLM is not None:
-                generate_module.LLaDAModelLM = LLaDAModelLM
+            # 必要な依存関係を注入
+            generate_module.__dict__.update({
+                'LLaDAModelLM': LLaDAModelLM,
+                'modeling_llada': model_module
+            })
 
-            sys.modules["generate"] = generate_module
+            sys.modules['llada.generate'] = generate_module
             spec_generate.loader.exec_module(generate_module)
 
             generate = generate_module.generate
             generate_with_prefix_cache = generate_module.generate_with_prefix_cache
             generate_with_dual_cache = generate_module.generate_with_dual_cache
 
-            print("✅ Fast-dLLMの生成関数を正常に読み込みました")
-            print(f"  - generate: {generate is not None}")
-            print(
-                f"  - generate_with_prefix_cache: {generate_with_prefix_cache is not None}")
-            print(
-                f"  - generate_with_dual_cache: {generate_with_dual_cache is not None}")
-            break
+            # ディレクトリを元に戻す
+            os.chdir(original_cwd)
 
-except Exception as e:
-    print(f"⚠️ Fast-dLLM実装の読み込みに失敗: {e}")
-    print("フォールバック: Hugging Face Transformersを使用します")
+            print("✅ 代替方法でインポート成功")
+
+        except Exception as e2:
+            print(f"❌ 代替方法も失敗: {e2}")
+            os.chdir(original_cwd)  # エラー時もディレクトリを戻す
+
+    except Exception as e:
+        print(f"❌ 予期しないエラー: {e}")
+        import traceback
+        traceback.print_exc()
+else:
+    print("❌ Fast-dLLMディレクトリが見つかりません")
 
 # フォールバック設定
 if LLaDAModelLM is None:
@@ -176,8 +274,7 @@ if LLaDAModelLM is None:
     LLaDAModelLM = AutoModelForCausalLM
 
 print(f"\n📋 最終的な実装状況:")
-print(
-    f"  - LLaDAModelLM: {'✅ Fast-dLLM' if LLaDAModelLM.__name__ == 'LLaDAModelLM' else '⚠️ Transformers AutoModel'}")
+print(f"  - LLaDAModelLM: {'✅ Fast-dLLM' if hasattr(LLaDAModelLM, '__module__') and 'modeling_llada' in LLaDAModelLM.__module__ else '⚠️ Transformers AutoModel'}")
 print(f"  - generate: {'✅' if generate is not None else '❌'}")
 print(
     f"  - generate_with_prefix_cache: {'✅' if generate_with_prefix_cache is not None else '❌'}")
