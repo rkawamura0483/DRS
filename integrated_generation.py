@@ -3,36 +3,35 @@ Fast-dLLM × LongLLaDA 統合生成機能
 Fast-dLLMの正しいデュアルキャッシュとLongLLaDAのRoPEスケーリングを組み合わせた高速長文生成
 """
 
-import torch
-import numpy as np
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from typing import Optional, Tuple, List
-import time
-import sys
-import os
-import glob
-import subprocess
 import importlib.util
+import subprocess
+import glob
+import time
+from typing import Optional, Tuple, List
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+import torch.nn.functional as F
+import numpy as np
+import torch
+import os
+import sys
+
+# Flash Attentionを無効化（バージョン競合を回避）
+os.environ["DISABLE_FLASH_ATTN"] = "1"
+os.environ["FLASH_ATTENTION_FORCE_FALLBACK"] = "1"
+os.environ["TRANSFORMERS_DISABLE_FLASH_ATTN"] = "1"
+
 
 # Flash Attentionのインストールチェックと自動インストール
 
 
 def check_flash_attention():
-    """Flash Attentionの確認（インストールは手動で行う）"""
-    try:
-        import flash_attn
-        print("✅ Flash Attention 利用可能")
-        return True
-    except ImportError:
-        print("⚠️ Flash Attention が見つかりません")
-        print("💡 Flash Attention無しでも動作しますが、速度が低下する可能性があります")
-        print("🔧 手動インストール方法（Colabの場合）:")
-        print("   !pip install flash-attn --no-build-isolation")
-        return False
+    """Flash Attentionの確認（バージョン競合を回避）"""
+    print("⚠️ Flash Attentionは無効化されています（バージョン競合回避のため）")
+    print("💡 通常のアテンション機構を使用します")
+    return False
 
 
-# Flash Attentionチェック（インストールは手動で行う）
+# Flash Attentionチェック（常に無効）
 has_flash_attention = check_flash_attention()
 
 # Fast-dLLMのパスを追加
@@ -709,7 +708,8 @@ def load_model_with_scaling(model_path, scaling_factor=1, device='auto'):
             config=config,
             torch_dtype=torch.float16,
             device_map=device,
-            trust_remote_code=True
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True  # 重みサイズ不一致を許容
         )
         print("✅ モデル読み込み成功")
     except Exception as e:
