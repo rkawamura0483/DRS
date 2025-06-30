@@ -6,9 +6,11 @@ Fast-dLLM の高速推論機構と LongLLaDA の長文拡張機構を **LLaDA** 
 
 | 機能 | 実装箇所 | 効果 |
 |------|----------|------|
-| **ブロック生成** | `LongLLaDA/llada/llada_generate.py` | 並列トークン生成で高速化 |
-| **RoPE スケーリング** | `LongLLaDA/llada/llada_wrapper.py` | 長文コンテキスト対応 |
-| **信頼度制御** | 生成関数の `remasking='low_confidence'` | 品質維持 |
+| **デュアルキャッシュ** | `integrated_generation.py` | 拡散LLM専用高速キャッシュ |
+| **RoPE スケーリング** | `integrated_generation.py` + LongLLaDA | 長文コンテキスト対応 |
+| **信頼度制御** | Fast-dLLMの正しい実装 | 品質維持 |
+
+> **🔧 重要な修正**: 標準的なKVキャッシュではなく、Fast-dLLMの正しい `generate_with_dual_cache` 実装を使用します。
 
 ---
 
@@ -78,15 +80,18 @@ formatted_prompt = tokenizer.apply_chat_template(
 
 input_ids = tokenizer(formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-# 生成実行
-outputs = generate(
+# 生成実行（Fast-dLLMの正しい実装）
+from integrated_generation import generate_fast_long_dual_cache
+
+outputs, nfe, metrics = generate_fast_long_dual_cache(
     model=model,
     prompt=input_ids,
     steps=128,          # 拡散ステップ数
     gen_length=256,     # 生成長
     block_length=32,    # ブロックサイズ
     temperature=0.0,    # 決定的生成
-    remasking='low_confidence'
+    remasking='low_confidence',
+    scaling_factor=1    # RoPEスケーリング係数
 )
 
 # 結果の表示
@@ -124,19 +129,21 @@ input_ids_long = tokenizer(long_prompt, return_tensors='pt').input_ids.to(model_
 
 print(f"入力長: {input_ids_long.shape[1]} トークン")
 
-# 長文対応生成
+# 長文対応生成（RoPEスケーリング + デュアルキャッシュ）
 if input_ids_long.shape[1] > 4000:  # 4k を超える場合
-    outputs_long = generate(
+    outputs_long, nfe, metrics = generate_fast_long_dual_cache(
         model=model_long,
         prompt=input_ids_long,
         steps=64,           # 長文では少なめに
         gen_length=512,
         block_length=64,    # 大きめのブロック
         temperature=0.0,
-        remasking='low_confidence'
+        remasking='low_confidence',
+        scaling_factor=14   # 16k対応
     )
     result_long = tokenizer.decode(outputs_long[0, input_ids_long.shape[1]:], skip_special_tokens=True)
     print("長文生成結果:", result_long[:200] + "...")
+    print(f"速度: {metrics['tokens_per_second']:.1f} tok/s")
 ```
 
 ---
@@ -146,7 +153,7 @@ if input_ids_long.shape[1] > 4000:  # 4k を超える場合
 ### 1. ブロックサイズ調整
 ```python
 # 高速重視（品質やや低下）
-outputs_fast = generate(
+outputs_fast, nfe_fast, metrics_fast = generate_fast_long_dual_cache(
     model, input_ids,
     steps=64,           # ステップ数削減
     gen_length=256,
@@ -156,7 +163,7 @@ outputs_fast = generate(
 )
 
 # 品質重視（速度やや低下）
-outputs_quality = generate(
+outputs_quality, nfe_quality, metrics_quality = generate_fast_long_dual_cache(
     model, input_ids,
     steps=256,          # ステップ数増加
     gen_length=256,

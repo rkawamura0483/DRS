@@ -3,7 +3,6 @@ Fast-dLLM × LongLLaDA 統合生成機能
 Fast-dLLMの正しいデュアルキャッシュとLongLLaDAのRoPEスケーリングを組み合わせた高速長文生成
 """
 
-from model.modeling_llada import LLaDAModelLM
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -11,9 +10,20 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from typing import Optional, Tuple, List
 import time
 import sys
+import os
 
-# Fast-dLLMのインポート
-sys.path.append('Fast-dLLM/llada')
+# Fast-dLLMのパスを追加
+current_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(current_dir, 'Fast-dLLM',
+                          'Fast-dLLM', 'llada', 'model')
+sys.path.insert(0, model_path)
+
+try:
+    from modeling_llada import LLaDAModelLM
+except ImportError:
+    # フォールバック: Hugging Face Hub のAutoModelForCausalLMを使用
+    print("⚠️  LLaDAModelLM が見つかりません。AutoModelForCausalLMを使用します。")
+    LLaDAModelLM = AutoModelForCausalLM
 
 
 def add_gumbel_noise(logits, temperature):
@@ -447,7 +457,7 @@ def load_model_with_scaling(model_path, scaling_factor=1, device='auto'):
         config.rope_theta = original_theta * scaling_factor
         print(f"🔧 RoPE θ: {original_theta} → {config.rope_theta}")
 
-    # LLaDAモデル読み込み（Fast-dLLMの正しいクラス使用）
+    # LLaDAモデル読み込み（Fast-dLLMの正しいクラス使用 または フォールバック）
     model = LLaDAModelLM.from_pretrained(
         model_path,
         config=config,

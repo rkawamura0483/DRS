@@ -2,6 +2,8 @@
 
 Fast-dLLMの高速推論機構とLongLLaDAの長文拡張機構を組み合わせた統合実験をGoogle Colabで実行するための完全ガイドです。
 
+> **🔧 重要**: この実装は修正済みです！LLaDAモデル用の正しい `generate_with_dual_cache` を使用し、標準的なKVキャッシュエラーを解決しています。
+
 ## 📋 事前準備
 
 ### 1. Google Colab セットアップ
