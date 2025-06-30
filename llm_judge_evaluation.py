@@ -219,7 +219,7 @@ def compare_configurations():
     config_a = {
         "name": "高速設定",
         "steps": 64,
-        "block_length": 64,
+        "block_length": 32,
         "remasking": "random"
     }
 
@@ -227,7 +227,7 @@ def compare_configurations():
     config_b = {
         "name": "品質重視設定",
         "steps": 256,
-        "block_length": 16,
+        "block_length": 32,
         "remasking": "low_confidence"
     }
 
