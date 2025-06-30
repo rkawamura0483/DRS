@@ -128,9 +128,13 @@ def evaluate_single_prompt(
         gts_output, gts_metrics = generate_with_gts_controlled_sampling(
             model, input_ids,
             gen_length=gen_length,
+            parallel_k=32,  # より小さなブロックで詳細な制御
             gts_threshold=gts_threshold,
             max_iterations=max_iterations,
-            verbose=False  # 詳細ログを無効化
+            steps_per_iteration=16,  # より多くのdiffusion stepsを実行
+            gts_metric_type='basic',  # 明示的にbasicを指定
+            temperature=0.1,  # 小さな温度でより安定した生成
+            verbose=True  # デバッグ用に詳細ログを有効化
         )
         gts_time = time.time() - start_time
         gts_text = tokenizer.batch_decode(

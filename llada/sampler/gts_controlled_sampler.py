@@ -300,6 +300,10 @@ def generate_with_gts_controlled_sampling(
             # 軌跡データからGTSメトリクス計算
             logits_sequence = trajectory_recorder.get_logits_sequence_for_gts()
 
+            if verbose:
+                print(
+                    f"   📊 軌跡データ: {len(logits_sequence)}ステップ, NFE={iteration_nfe}")
+
             if len(logits_sequence) >= 2:
                 try:
                     # GTSメトリクスを使用して安定性を評価
@@ -315,12 +319,20 @@ def generate_with_gts_controlled_sampling(
 
                     gts_score = gts_metric.value()
 
+                    if verbose:
+                        print(
+                            f"   📊 GTS詳細: ステップ数={gts_metric.num_steps}, トークン数={gts_metric.num_tokens}")
+                        if hasattr(gts_metric, 'total_flips'):
+                            print(f"   📊 フリップ数: {gts_metric.total_flips}")
+
                 except Exception as e:
                     if verbose:
                         print(f"   ⚠️ GTS計算エラー: {e}")
                     gts_score = 1.0  # エラー時は安定と仮定
 
             else:
+                if verbose:
+                    print(f"   ⚠️ 軌跡データ不足: {len(logits_sequence)}ステップ")
                 gts_score = 1.0  # データ不足時は安定と仮定
 
             gts_computation_time = time.time() - gts_start_time

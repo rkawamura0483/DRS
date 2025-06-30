@@ -142,8 +142,12 @@ class BasicGTS(BaseGTSMetric):
         Returns:
             0.0-1.0 の範囲のスコア（1.0が最も安定）
         """
-        if self.num_steps <= 1 or self.num_tokens == 0:
-            return 1.0  # データが不十分な場合は最大安定性と仮定
+        if self.num_steps == 0 or self.num_tokens == 0:
+            return 1.0  # データが全くない場合のみ最大安定性と仮定
+
+        # ステップ数が1の場合、フリップは発生し得ないので安定とみなす
+        if self.num_steps == 1:
+            return 1.0
 
         max_possible_flips = self.num_tokens * (self.num_steps - 1)
         if max_possible_flips == 0:
