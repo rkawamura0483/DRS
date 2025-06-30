@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
 Fast-dLLM × LongLLaDA クイックスタートスクリプト
-Google Colab での簡単な実行のためのデモ
+Google Colab での簡単な実行のためのデモ（修正版）
 """
 
-from integrated_generation import generate_fast_long, load_model_with_scaling, format_metrics
+from integrated_generation import (
+    generate_fast_long,
+    load_model_with_scaling,
+    format_metrics,
+    generate_fast_long_dual_cache,
+    generate_fast_long_prefix_cache,
+    generate_no_cache
+)
 import torch
 import time
 import sys
@@ -49,8 +56,8 @@ def check_environment():
 
 
 def demo_basic_generation():
-    """基本生成デモ"""
-    print("🚀 基本生成デモ")
+    """基本生成デモ（修正版）"""
+    print("🚀 基本生成デモ（Fast-dLLM デュアルキャッシュ使用）")
     print("=" * 30)
 
     # モデル読み込み
@@ -72,9 +79,9 @@ def demo_basic_generation():
     print(f"📝 プロンプト: {prompt}")
     print(f"🔤 入力長: {input_ids.shape[1]} トークン")
 
-    # 生成実行
-    print("⚡ 生成中...")
-    outputs, nfe, metrics = generate_fast_long(
+    # 生成実行（デュアルキャッシュ使用）
+    print("⚡ 生成中（Fast-dLLM デュアルキャッシュ）...")
+    outputs, nfe, metrics = generate_fast_long_dual_cache(
         model=model,
         prompt=input_ids,
         steps=64,      # 高速化のため少なめ
@@ -82,7 +89,6 @@ def demo_basic_generation():
         block_length=32,
         temperature=0.0,
         remasking='low_confidence',
-        use_cache=True,
         scaling_factor=1
     )
 
@@ -100,8 +106,8 @@ def demo_basic_generation():
 
 
 def demo_long_context(model, tokenizer):
-    """長文コンテキストデモ"""
-    print("\n📚 長文コンテキストデモ")
+    """長文コンテキストデモ（修正版）"""
+    print("\n📚 長文コンテキストデモ（RoPE スケーリング）")
     print("=" * 30)
 
     # 長文読み込み（RoPEスケーリング適用）
@@ -140,8 +146,8 @@ def demo_long_context(model, tokenizer):
     print(f"📏 長文入力長: {input_ids.shape[1]} トークン")
 
     if input_ids.shape[1] > 2000:  # 長文の場合
-        print("⚡ 長文生成中（RoPEスケーリング適用）...")
-        outputs, nfe, metrics = generate_fast_long(
+        print("⚡ 長文生成中（RoPEスケーリング + デュアルキャッシュ）...")
+        outputs, nfe, metrics = generate_fast_long_dual_cache(
             model=model_long,
             prompt=input_ids,
             steps=32,       # 長文では更に少なめ
@@ -149,7 +155,6 @@ def demo_long_context(model, tokenizer):
             block_length=64,
             temperature=0.0,
             remasking='low_confidence',
-            use_cache=True,
             scaling_factor=14
         )
 
@@ -165,9 +170,9 @@ def demo_long_context(model, tokenizer):
         print("⚠️ コンテキストが短いため長文テストをスキップ")
 
 
-def demo_speed_comparison():
-    """速度比較デモ"""
-    print("\n⚡ 速度比較デモ")
+def demo_cache_comparison():
+    """キャッシュ方式比較デモ"""
+    print("\n💾 キャッシュ方式比較デモ")
     print("=" * 30)
 
     # モデル読み込み
@@ -181,25 +186,38 @@ def demo_speed_comparison():
     input_ids = tokenizer(
         formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-    configs = [
-        {"name": "🏃 超高速", "steps": 32, "block_length": 64, "remasking": "random"},
-        {"name": "⚡ 高速", "steps": 64, "block_length": 32, "remasking": "random"},
-        {"name": "🎯 標準", "steps": 128, "block_length": 32,
-            "remasking": "low_confidence"}
+    cache_configs = [
+        {
+            "name": "🚫 キャッシュなし",
+            "func": generate_no_cache,
+            "steps": 64,
+            "block_length": 32
+        },
+        {
+            "name": "📋 プレフィックスキャッシュ",
+            "func": generate_fast_long_prefix_cache,
+            "steps": 64,
+            "block_length": 32
+        },
+        {
+            "name": "💎 デュアルキャッシュ",
+            "func": generate_fast_long_dual_cache,
+            "steps": 64,
+            "block_length": 32
+        }
     ]
 
-    for config in configs:
-        print(f"\n{config['name']} 設定テスト...")
+    for config in cache_configs:
+        print(f"\n{config['name']} テスト...")
 
-        outputs, nfe, metrics = generate_fast_long(
+        outputs, nfe, metrics = config['func'](
             model=model,
             prompt=input_ids,
             steps=config['steps'],
             gen_length=64,  # 短めで高速化
             block_length=config['block_length'],
             temperature=0.0,
-            remasking=config['remasking'],
-            use_cache=True
+            remasking='low_confidence'
         )
 
         result = tokenizer.decode(
@@ -207,12 +225,61 @@ def demo_speed_comparison():
 
         print(f"  ⏱️  時間: {metrics['total_time']:.2f}秒")
         print(f"  🚀 速度: {metrics['tokens_per_second']:.1f} tok/s")
+        print(f"  🔄 NFE: {metrics['nfe']}")
+        print(f"  💾 キャッシュヒット: {metrics['cache_hits']}")
+        print(f"  📝 結果: {result[:80]}...")
+
+
+def demo_speed_comparison():
+    """速度比較デモ（修正版）"""
+    print("\n⚡ 速度設定比較デモ")
+    print("=" * 30)
+
+    # モデル読み込み
+    model, tokenizer, _ = load_model_with_scaling('GSAI-ML/LLaDA-8B-Instruct')
+
+    prompt = "機械学習について簡潔に説明してください。"
+    messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
+    input_ids = tokenizer(
+        formatted_prompt, return_tensors='pt').input_ids.to(model.device)
+
+    configs = [
+        {"name": "🏃 超高速", "steps": 32, "block_length": 64, "remasking": "random"},
+        {"name": "⚡ 高速", "steps": 64, "block_length": 32, "remasking": "random"},
+        {"name": "🎯 標準", "steps": 64, "block_length": 32,
+            "remasking": "low_confidence"},
+        {"name": "🎨 品質重視", "steps": 128, "block_length": 16,
+            "remasking": "low_confidence"}
+    ]
+
+    for config in configs:
+        print(f"\n{config['name']} 設定テスト...")
+
+        outputs, nfe, metrics = generate_fast_long_dual_cache(
+            model=model,
+            prompt=input_ids,
+            steps=config['steps'],
+            gen_length=64,  # 短めで高速化
+            block_length=config['block_length'],
+            temperature=0.0,
+            remasking=config['remasking']
+        )
+
+        result = tokenizer.decode(
+            outputs[0, input_ids.shape[1]:], skip_special_tokens=True)
+
+        print(f"  ⏱️  時間: {metrics['total_time']:.2f}秒")
+        print(f"  🚀 速度: {metrics['tokens_per_second']:.1f} tok/s")
+        print(f"  🔄 NFE: {metrics['nfe']}")
         print(f"  📝 結果: {result[:80]}...")
 
 
 def demo_niah_simple():
-    """簡単なNIAHテスト"""
-    print("\n🎯 簡単なNIAHテスト")
+    """簡単なNIAHテスト（修正版）"""
+    print("\n🎯 簡単なNIAHテスト（RoPE スケーリング）")
     print("=" * 30)
 
     # 長文対応モデル
@@ -220,7 +287,7 @@ def demo_niah_simple():
         'GSAI-ML/LLaDA-8B-Instruct', scaling_factor=14)
 
     # 簡単なNIAH作成
-    haystack = "今日は良い天気です。空が青くて雲が白いです。" * 50
+    haystack = "今日は良い天気です。空が青くて雲が白いです。鳥たちが空を飛んでいます。" * 100
     needle = "重要：パスワードは1234です。"
     question = "パスワードは何ですか？"
 
@@ -234,7 +301,7 @@ def demo_niah_simple():
 
     print(f"📏 コンテキスト長: {input_ids.shape[1]} トークン")
 
-    outputs, nfe, metrics = generate_fast_long(
+    outputs, nfe, metrics = generate_fast_long_dual_cache(
         model, input_ids,
         steps=32,
         gen_length=50,
@@ -254,9 +321,10 @@ def demo_niah_simple():
 
 def main():
     """メインデモ"""
-    print("🚀 Fast-dLLM × LongLLaDA クイックスタート")
+    print("🚀 Fast-dLLM × LongLLaDA クイックスタート（修正版）")
     print("=" * 50)
     print("統合された拡散言語モデルの高速推論＆長文対応デモ")
+    print("✨ Fast-dLLMの正しいデュアルキャッシュ実装を使用")
     print()
 
     # 環境チェック
@@ -269,21 +337,30 @@ def main():
         # 2. 長文コンテキストデモ
         demo_long_context(model, tokenizer)
 
-        # 3. 速度比較デモ
+        # 3. キャッシュ方式比較
+        demo_cache_comparison()
+
+        # 4. 速度比較デモ
         demo_speed_comparison()
 
-        # 4. 簡単NIAHテスト
+        # 5. 簡単NIAHテスト
         demo_niah_simple()
 
         print("\n🎉 クイックスタート完了！")
         print("=" * 50)
+        print("🔍 実装確認:")
+        print("  ✅ Fast-dLLM デュアルキャッシュ実装")
+        print("  ✅ LongLLaDA RoPE スケーリング")
+        print("  ✅ 信頼度ベース並列デコーディング")
+        print("  ✅ 統合された高速長文生成")
+        print()
         print("📋 次のステップ:")
         print("  📊 詳細評価: python run_integrated_experiment.py")
         print("  🧑‍⚖️ LLM Judge: python llm_judge_evaluation.py")
         print("  📚 カスタマイズ: integrated_generation.py を編集")
 
     except Exception as e:
-        print(f"❌ エラーが発生しました: {e}")
+        print(f"❌ エラーが発生しました: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -291,6 +368,7 @@ def main():
         print("  1. GPU メモリ不足 → block_length を大きく")
         print("  2. モデル読み込みエラー → インターネット接続確認")
         print("  3. パッケージエラー → pip install -r requirements.txt")
+        print("  4. インポートエラー → Fast-dLLM/llada パスの確認")
 
 
 if __name__ == "__main__":

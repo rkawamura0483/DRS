@@ -6,6 +6,9 @@ Google Colab での実行に最適化されています
 
 from integrated_generation import (
     generate_fast_long,
+    generate_fast_long_dual_cache,
+    generate_fast_long_prefix_cache,
+    generate_no_cache,
     load_model_with_scaling,
     format_metrics,
     add_gumbel_noise,
@@ -76,8 +79,8 @@ def test_basic_generation(model, tokenizer, scaling_factor=1):
         block_length=32,
         temperature=0.0,
         remasking='low_confidence',
-        use_cache=True,
-        scaling_factor=scaling_factor
+        scaling_factor=scaling_factor,
+        dual_cache=True
     )
 
     # 結果表示
@@ -124,8 +127,8 @@ def test_long_context(model, tokenizer, scaling_factor=14):
             block_length=64,    # 大きめのブロック
             temperature=0.0,
             remasking='low_confidence',
-            use_cache=True,
-            scaling_factor=scaling_factor
+            scaling_factor=scaling_factor,
+            dual_cache=True
         )
 
         result = tokenizer.decode(
@@ -178,7 +181,7 @@ def performance_comparison():
             block_length=config['block_length'],
             temperature=0.0,
             remasking=config['remasking'],
-            use_cache=True
+            dual_cache=True
         )
 
         result_text = tokenizer.decode(
@@ -233,7 +236,8 @@ def niah_test(model, tokenizer, context_length=8000, scaling_factor=14):
         steps=64,
         gen_length=100,
         block_length=32,
-        scaling_factor=scaling_factor
+        scaling_factor=scaling_factor,
+        dual_cache=True
     )
 
     result = tokenizer.decode(

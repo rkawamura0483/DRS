@@ -247,7 +247,7 @@ def compare_configurations():
 
         # 設定Aで生成
         outputs_a_raw, _, _ = generate_fast_long(
-            model=model, prompt=input_ids, gen_length=128, **config_a
+            model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_a
         )
         result_a = tokenizer.decode(
             outputs_a_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
@@ -255,7 +255,7 @@ def compare_configurations():
 
         # 設定Bで生成
         outputs_b_raw, _, _ = generate_fast_long(
-            model=model, prompt=input_ids, gen_length=128, **config_b
+            model=model, prompt=input_ids, gen_length=128, dual_cache=True, **config_b
         )
         result_b = tokenizer.decode(
             outputs_b_raw[0, input_ids.shape[1]:], skip_special_tokens=True)
