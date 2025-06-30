@@ -416,6 +416,13 @@ def generate_fast_long_dual_cache(model, prompt, steps=128, gen_length=128, bloc
     start_time = time.time()
     device = model.device
 
+    # gen_length が block_length の倍数でない場合は自動調整
+    if gen_length % block_length != 0:
+        adjusted_length = ((gen_length // block_length) + 1) * block_length
+        print(f"⚠️ gen_length ({gen_length}) は block_length ({block_length}) の倍数ではありません。 "
+              f"自動で {adjusted_length} に切り上げます。")
+        gen_length = adjusted_length
+
     # RoPEスケーリング適用（LongLLaDA）
     original_theta = None
     if scaling_factor > 1 and hasattr(model.config, 'rope_theta'):
