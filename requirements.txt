@@ -10,3 +10,4 @@ gradio
 datasets==3.0.0
 matplotlib
 tqdm
+scipy

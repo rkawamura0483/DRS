@@ -24,13 +24,20 @@ from model.modeling_llada import LLaDAModelLM
 from tqdm import tqdm
 
 # ADAPTIVE SCHEDULING INTEGRATION
+# try:
+#     from generate_adaptive import generate_with_adaptive_scheduling
+#     from adaptive_scheduler import AdaptiveInferenceScheduler
+#     from cache_manager import TieredCacheManager
+#     ADAPTIVE_SCHEDULING_AVAILABLE = True
+# except ImportError:
+#     ADAPTIVE_SCHEDULING_AVAILABLE = False
+
+# GTS CONTROLLED SAMPLING INTEGRATION
 try:
-    from generate_adaptive import generate_with_adaptive_scheduling
-    from adaptive_scheduler import AdaptiveInferenceScheduler
-    from cache_manager import TieredCacheManager
-    ADAPTIVE_SCHEDULING_AVAILABLE = True
+    from sampler.gts_controlled_sampler import generate_with_gts_controlled_sampling
+    GTS_SAMPLING_AVAILABLE = True
 except ImportError:
-    ADAPTIVE_SCHEDULING_AVAILABLE = False
+    GTS_SAMPLING_AVAILABLE = False
 
 
 def add_gumbel_noise(logits, temperature):
@@ -317,99 +324,148 @@ def get_transfer_index_with_confidence(logits, temperature, remasking, mask_inde
 
 
 def main():
-    device = 'cuda'
+    import argparse
+    import time
 
+    parser = argparse.ArgumentParser(
+        description='LLaDA生成with multiple samplers')
+    parser.add_argument('--sampler', type=str, default='dual_cache',
+                        choices=['dual_cache', 'gts', 'compare'],
+                        help='使用するサンプラー (default: dual_cache)')
+    parser.add_argument('--prompt', type=str,
+                        default="Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?",
+                        help='生成に使用するプロンプト')
+    parser.add_argument('--gen_length', type=int, default=128,
+                        help='生成する長さ (default: 128)')
+    parser.add_argument('--gts_threshold', type=float, default=0.8,
+                        help='GTS制御サンプリングの閾値 (default: 0.8)')
+    parser.add_argument('--max_iterations', type=int, default=3,
+                        help='GTS制御サンプリングの最大反復回数 (default: 3)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='詳細な出力を表示')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='使用するデバイス (default: cuda)')
+
+    args = parser.parse_args()
+
+    device = args.device
+
+    # モデルとトークナイザーのロード
+    print(f"🤖 モデルロード中...")
     model = LLaDAModelLM.from_pretrained(
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
-    prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
-
-    # Add special tokens for the Instruct model. The Base model does not require the following two lines.
+    # プロンプト処理
+    prompt = args.prompt
     m = [{"role": "user", "content": prompt}, ]
-    prompt = tokenizer.apply_chat_template(
+    formatted_prompt = tokenizer.apply_chat_template(
         m, add_generation_prompt=True, tokenize=False)
 
-    input_ids = tokenizer(prompt)['input_ids']
+    input_ids = tokenizer(formatted_prompt)['input_ids']
     input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
 
-    out = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128,
-                                   block_length=32, temperature=0., remasking='low_confidence')
-    print(tokenizer.batch_decode(
-        out[0][:, input_ids.shape[1]:], skip_special_tokens=True)[0])
+    print(f"📝 プロンプト: {prompt}")
+    print(f"🎯 サンプラー: {args.sampler}")
+    print(f"📏 生成長: {args.gen_length}")
+    print("=" * 50)
 
+    # サンプラー選択と実行
+    if args.sampler == 'dual_cache':
+        print("🚀 Dual Cache サンプリング実行中...")
+        start_time = time.time()
+        out, nfe = generate_with_dual_cache(
+            model, input_ids, steps=128, gen_length=args.gen_length,
+            block_length=32, temperature=0., remasking='low_confidence')
+        generation_time = time.time() - start_time
 
-# ============= ADAPTIVE SCHEDULING INTEGRATION =============
+        generated_text = tokenizer.batch_decode(
+            out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
-@torch.no_grad()
-def generate_adaptive(model, prompt, gen_length=128, base_block_size=16,
-                      base_confidence_threshold=0.8, adaptation_rate=0.2,
-                      enable_tiered_cache=True, temperature=0.,
-                      remasking='low_confidence', mask_id=None, verbose=False):
-    """
-    アダプティブスケジューリング統合関数
+        print(f"✅ 生成完了 (NFE: {nfe}, 時間: {generation_time:.2f}s)")
+        print(f"📄 生成結果:\n{generated_text}")
 
-    既存のgenerate関数群と同じインターフェースで、
-    Self-Correcting Adaptive Inference Schedulingを使用した生成を提供。
+    elif args.sampler == 'gts':
+        if not GTS_SAMPLING_AVAILABLE:
+            print("❌ GTS制御サンプリングが利用できません")
+            return
 
-    Args:
-        model: LLaDAモデル
-        prompt: 入力プロンプト
-        gen_length: 生成長
-        base_block_size: 初期ブロックサイズ
-        base_confidence_threshold: 初期信頼度閾値
-        adaptation_rate: 適応率
-        enable_tiered_cache: 階層キャッシュを有効にするか
-        temperature: サンプリング温度
-        remasking: リマスキング戦略
-        mask_id: マスクトークンID
-        verbose: 詳細出力
+        print("🎯 GTS制御サンプリング実行中...")
+        start_time = time.time()
+        out, metrics = generate_with_gts_controlled_sampling(
+            model, input_ids,
+            gen_length=args.gen_length,
+            gts_threshold=args.gts_threshold,
+            max_iterations=args.max_iterations,
+            verbose=args.verbose)
+        generation_time = time.time() - start_time
 
-    Returns:
-        (生成されたテンソル, NFE数) - 既存関数と同じ形式
-    """
-    if not ADAPTIVE_SCHEDULING_AVAILABLE:
-        print("⚠️ アダプティブスケジューリングが利用できません。")
-        print("   代わりにgenerate_with_dual_cacheを使用します。")
-        return generate_with_dual_cache(
-            model, prompt, steps=128, gen_length=gen_length,
-            block_length=base_block_size, temperature=temperature,
-            remasking=remasking, mask_id=mask_id
-        )
+        generated_text = tokenizer.batch_decode(
+            out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
-    # アダプティブスケジューリングで生成
-    output, metrics = generate_with_adaptive_scheduling(
-        model=model,
-        prompt=prompt,
-        gen_length=gen_length,
-        base_block_size=base_block_size,
-        base_confidence_threshold=base_confidence_threshold,
-        adaptation_rate=adaptation_rate,
-        enable_tiered_cache=enable_tiered_cache,
-        temperature=temperature,
-        remasking=remasking,
-        mask_id=mask_id,
-        verbose=verbose
-    )
+        print(
+            f"✅ 生成完了 (NFE: {metrics['nfe']}, 反復: {metrics['iterations']}, 時間: {generation_time:.2f}s)")
+        print(
+            f"📊 最終GTS: {metrics['gts_scores'][-1] if metrics['gts_scores'] else 'N/A':.4f}")
+        print(f"📄 生成結果:\n{generated_text}")
 
-    # 既存インターフェースに合わせて返り値を調整
-    return output, metrics['nfe']
+    elif args.sampler == 'compare':
+        print("📊 全手法比較実行中...")
+
+        # 比較実行
+        results = compare_generation_methods(
+            model, input_ids, gen_length=args.gen_length, verbose=args.verbose)
+
+        # GTS制御サンプリングも追加
+        if GTS_SAMPLING_AVAILABLE:
+            print("🎯 GTS制御サンプリングも比較に追加...")
+            start_time = time.time()
+            gts_out, gts_metrics = generate_with_gts_controlled_sampling(
+                model, input_ids,
+                gen_length=args.gen_length,
+                gts_threshold=args.gts_threshold,
+                max_iterations=args.max_iterations,
+                verbose=False)
+            gts_time = time.time() - start_time
+
+            results['gts'] = {
+                'output': gts_out,
+                'nfe': gts_metrics['nfe'],
+                'time': gts_time,
+                'method': 'GTS Controlled',
+                'iterations': gts_metrics['iterations'],
+                'final_gts': gts_metrics['gts_scores'][-1] if gts_metrics['gts_scores'] else 0.0
+            }
+
+        # 結果表示
+        print("\n" + "=" * 60)
+        print("📈 最終比較結果")
+        print("=" * 60)
+
+        for method_name, result in results.items():
+            if method_name != 'comparison':
+                method = result['method']
+                nfe = result['nfe']
+                time_taken = result['time']
+                print(f"{method:20s}: NFE={nfe:3d}, 時間={time_taken:6.2f}s")
+
+                if method_name == 'gts' and 'final_gts' in result:
+                    print(
+                        f"{'':20s}  反復={result['iterations']}, 最終GTS={result['final_gts']:.4f}")
+
+        # 生成結果の表示
+        print(f"\n📄 生成結果 (dual_cacheで生成):")
+        generated_text = tokenizer.batch_decode(
+            results['dual_cache']['output'][:, input_ids.shape[1]:],
+            skip_special_tokens=True)[0]
+        print(generated_text)
 
 
 @torch.no_grad()
 def compare_generation_methods(model, prompt, gen_length=128, verbose=True):
     """
-    各生成手法の比較を実行
-
-    Args:
-        model: LLaDAモデル
-        prompt: 入力プロンプト
-        gen_length: 生成長
-        verbose: 詳細出力
-
-    Returns:
-        比較結果の辞書
+    各生成手法の比較を実行 (Dual Cache + GTS)
     """
     import time
 
@@ -419,7 +475,7 @@ def compare_generation_methods(model, prompt, gen_length=128, verbose=True):
         print("🔍 生成手法比較開始")
         print("=" * 50)
 
-    # 1. 標準的なgenerate_with_dual_cache
+    # 1. Dual Cache 生成
     if verbose:
         print("📊 generate_with_dual_cache 実行中...")
 
@@ -436,48 +492,6 @@ def compare_generation_methods(model, prompt, gen_length=128, verbose=True):
         'time': dual_cache_time,
         'method': 'Dual Cache (Static)'
     }
-
-    # 2. アダプティブスケジューリング
-    if ADAPTIVE_SCHEDULING_AVAILABLE:
-        if verbose:
-            print("🚀 adaptive scheduling 実行中...")
-
-        start_time = time.time()
-        adaptive_output, adaptive_nfe = generate_adaptive(
-            model, prompt, gen_length=gen_length,
-            verbose=False
-        )
-        adaptive_time = time.time() - start_time
-
-        results['adaptive'] = {
-            'output': adaptive_output,
-            'nfe': adaptive_nfe,
-            'time': adaptive_time,
-            'method': 'Adaptive Scheduling'
-        }
-
-        # 比較メトリクス
-        speedup = dual_cache_time / adaptive_time if adaptive_time > 0 else 0
-        nfe_reduction = (dual_cache_nfe - adaptive_nfe) / \
-            dual_cache_nfe if dual_cache_nfe > 0 else 0
-
-        results['comparison'] = {
-            'speedup': speedup,
-            'nfe_reduction_percent': nfe_reduction * 100,
-            'adaptive_faster': adaptive_time < dual_cache_time
-        }
-
-        if verbose:
-            print(f"\n📈 比較結果:")
-            print(
-                f"   Dual Cache: {dual_cache_time:.2f}s, NFE={dual_cache_nfe}")
-            print(f"   Adaptive:   {adaptive_time:.2f}s, NFE={adaptive_nfe}")
-            print(f"   スピードアップ: {speedup:.2f}x")
-            print(f"   NFE削減: {nfe_reduction*100:.1f}%")
-
-    else:
-        if verbose:
-            print("⚠️ アダプティブスケジューリングは利用できません")
 
     return results
 

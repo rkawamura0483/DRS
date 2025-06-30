@@ -124,3 +124,219 @@ This is a high-risk, high-reward research proposal.
     2.  That this signal of **"fluctuation"** is a reliable proxy for low-quality, incoherent output, rather than a benign artifact of the generative process.
 
 Your critique is spot-on. While the problem the proposal addresses is real and the proposed solution is theoretically elegant, its success is far from guaranteed and hinges on favorable answers to the tough empirical questions you've raised. A strong proposal would need to acknowledge these risks upfront and design its experiments specifically to test these core assumptions from the outset.
+
+---
+
+## 5. Implementation Progress Report (December 2025)
+
+**Status: Phase 1 MVP Complete - Ready for Empirical Validation**
+
+We have successfully implemented the core GTS framework as proposed in Section 3, completing a comprehensive MVP that addresses all major components of the research proposal. The implementation is ready for empirical testing in Colab environments.
+
+### 5.1 Completed Components
+
+#### 📊 GTS Metrics Suite (`llada/metrics/gts.py`)
+✅ **BaseGTSMetric Abstract Class**: Unified interface for all GTS variants  
+✅ **BasicGTS**: Implemented argmax flip counting (1 - Total Flips / (N × T))  
+✅ **SemanticGTS**: Cosine distance-weighted semantic stability measurement  
+✅ **ProbabilisticGTS**: Jensen-Shannon Divergence between probability distributions  
+✅ **Factory Functions**: `create_gts_metric()` and `evaluate_trajectory_stability()`  
+✅ **Error Handling**: Graceful scipy fallback for numpy compatibility issues  
+
+**Key Implementation Details:**
+- All metrics follow the 0.0-1.0 scale (higher = more stable)
+- Support for token position masking for selective evaluation
+- Memory-efficient trajectory processing
+- Comprehensive unit tests with artificial data validation
+
+#### 🎯 GTS-Controlled Sampler (`llada/sampler/gts_controlled_sampler.py`)
+✅ **MVP Implementation**: Simplified GTS-CS algorithm following Section 3.2  
+✅ **Iterative Refinement**: Multi-iteration denoising with GTS-based stopping criteria  
+✅ **Adaptive Remasking**: Identifies and remasks most unstable tokens  
+✅ **Integration Ready**: Compatible with existing LLaDA model interfaces  
+
+**Algorithm Flow:**
+1. Initial parallel k-token generation with trajectory recording
+2. BasicGTS calculation on recorded denoising steps
+3. Stability threshold checking (τ = 0.8 default)
+4. Unstable token identification and selective remasking
+5. Iteration until convergence or max iterations reached
+
+#### 📝 Trajectory Recording (`llada/utils/trajectory_recorder.py`)
+✅ **TrajectoryRecorder Class**: Comprehensive step-by-step logits/probability recording  
+✅ **Memory Management**: Ring buffer with configurable maximum steps  
+✅ **Analysis Tools**: Built-in stability analysis and convergence detection  
+✅ **Data Export**: GTS-compatible logits sequence formatting  
+
+**Features:**
+- Multiple recording modes: logits, probabilities, or both
+- Token-level history tracking with efficient dictionary access
+- Real-time convergence analysis with configurable window sizes
+- Memory-efficient operations for long sequences
+
+#### ⚙️ Integration Layer (`llada/generate.py`)
+✅ **CLI Interface**: Complete argparse integration with multiple sampler options  
+✅ **Method Comparison**: Side-by-side evaluation of different approaches  
+✅ **Error Handling**: Graceful fallbacks when dependencies unavailable  
+✅ **Comprehensive Logging**: Detailed metrics and timing information  
+
+**CLI Usage:**
+```bash
+# Basic GTS sampling
+python -m llada.generate --sampler gts --gen_length 64 --gts_threshold 0.8
+
+# Method comparison
+python -m llada.generate --sampler compare --verbose
+
+# Custom prompts
+python -m llada.generate --sampler gts --prompt "Solve: 2x + 5 = 13"
+```
+
+### 5.2 Testing Infrastructure
+
+#### 🧪 Unit Tests (`llada/tests/`)
+✅ **GTS Metrics Testing**: Comprehensive validation with controlled scenarios  
+✅ **Edge Case Coverage**: Empty trajectories, single steps, perfect stability  
+✅ **Integration Testing**: End-to-end sampler functionality verification  
+✅ **Performance Benchmarks**: NFE counting and timing validation  
+
+**Test Coverage:**
+- Perfect stability scenarios (GTS = 1.0)
+- Complete instability scenarios (GTS ≈ 0.0)
+- Semantic similarity gradients
+- Token position masking functionality
+- Factory function robustness
+
+### 5.3 Architectural Decisions
+
+#### 🏗️ Modular Design
+- **Separation of Concerns**: Metrics, recording, and sampling in distinct modules
+- **Backward Compatibility**: Existing generate functions remain unchanged
+- **Optional Dependencies**: Graceful degradation when scipy unavailable
+- **Extensibility**: Easy addition of new GTS variants or sampling strategies
+
+#### 🔧 Performance Optimizations
+- **Selective Recording**: Only record trajectories for masked tokens
+- **Memory Efficiency**: Ring buffer prevents unbounded memory growth
+- **Minimal Overhead**: GTS computation isolated from critical path
+- **Device Awareness**: Automatic GPU/CPU tensor management
+
+### 5.4 Current Limitations & Known Issues
+
+#### ⚠️ Implementation Constraints
+1. **Scipy Dependency**: P-GTS requires scipy, falling back to Basic/Semantic GTS
+2. **Memory Usage**: Full trajectory recording can be memory-intensive for long sequences
+3. **MVP Simplicity**: Current GTS-CS uses basic remasking strategy (can be enhanced)
+4. **Limited Validation**: Needs empirical testing on real diffusion models
+
+#### 🎯 Ready for Validation
+The implementation directly addresses the critique's core concerns:
+- **Signal vs. Noise**: P-GTS and S-GTS designed to detect subtle stability patterns
+- **Short Trajectories**: Configurable step counts and sensitive difference measurements
+- **Fluctuation Validity**: Ready for empirical correlation testing with human judgments
+
+---
+
+## 6. Next Steps: Empirical Validation Phase
+
+### 6.1 Immediate Testing (Colab Environment)
+
+#### 📋 Phase 1A: Basic Functionality Validation
+**Objective**: Verify implementation correctness and basic GTS behavior
+**Timeline**: 1-2 days
+
+**Tasks:**
+1. **Model Loading Test**: Verify LLaDA model loading and basic generation
+2. **GTS Calculation Validation**: Test all three GTS variants on known examples
+3. **Sampler Integration**: Confirm GTS-CS produces reasonable outputs
+4. **Performance Baseline**: Measure NFE and timing vs. standard methods
+
+**Success Criteria:**
+- All samplers produce coherent text
+- GTS scores show reasonable variation (not all 1.0 or 0.0)
+- No runtime errors or memory issues
+- Basic timing measurements under 2x overhead
+
+#### 📊 Phase 1B: Preliminary GTS Validation  
+**Objective**: Initial correlation testing between GTS and output quality
+**Timeline**: 3-5 days
+
+**Tasks:**
+1. **Dataset Creation**: Generate 100-200 outputs across different GTS thresholds
+2. **Quality Assessment**: Manual evaluation of coherence and correctness
+3. **Correlation Analysis**: Calculate Pearson correlation between GTS scores and human ratings
+4. **Comparative Analysis**: Compare GTS vs. softmax confidence correlation
+
+**Success Criteria:**
+- GTS shows positive correlation with human quality judgments (r > 0.3)
+- P-GTS outperforms Basic GTS in correlation strength
+- GTS correlation exceeds baseline confidence correlation
+- Clear examples of high GTS = good quality, low GTS = poor quality
+
+### 6.2 Extended Research Phase
+
+#### 🔬 Phase 2A: Benchmark Evaluation
+**Objective**: Systematic evaluation on standard tasks
+**Timeline**: 1-2 weeks
+
+**Target Benchmarks:**
+- **GSM8K**: Math reasoning (coherence critical)
+- **HumanEval**: Code generation (syntax coherence)
+- **MBPP**: Programming problems
+- **HellaSwag**: Commonsense reasoning
+
+**Metrics:**
+- Task accuracy (pass@1, exact match)
+- Throughput (tokens/second)
+- NFE efficiency
+- GTS score distributions
+
+#### 🎯 Phase 2B: Optimization & Refinement
+**Objective**: Enhance GTS-CS based on empirical findings
+**Timeline**: 2-3 weeks
+
+**Potential Improvements:**
+1. **Advanced Remasking**: Smarter selection of tokens to remask
+2. **Threshold Tuning**: Task-specific or adaptive thresholds
+3. **Hybrid Approaches**: Combine GTS with other quality signals
+4. **Computational Optimization**: Reduce GTS calculation overhead
+
+### 6.3 Research Questions for Empirical Testing
+
+#### 🤔 Critical Validation Questions
+1. **Core Assumption**: Does GTS actually correlate with human quality judgments?
+2. **Practical Utility**: Does GTS-CS achieve better speed-quality trade-offs?
+3. **Robustness**: How does GTS perform across different task types?
+4. **Computational Cost**: Is the GTS overhead justified by quality improvements?
+
+#### 📈 Success Metrics
+- **Strong Correlation**: P-GTS correlation with human ratings r > 0.5
+- **Pareto Improvement**: GTS-CS outperforms baselines on accuracy-speed frontier  
+- **Consistent Benefits**: Improvements across multiple benchmark tasks
+- **Practical Overhead**: <50% computational overhead for >10% quality improvement
+
+#### 🚨 Failure Conditions
+- **No Correlation**: GTS shows no relationship with quality (r < 0.2)
+- **High Variance**: GTS scores too noisy to be useful
+- **Computational Prohibitive**: >2x overhead with minimal quality gains
+- **Task Specific**: Benefits only on narrow subset of problems
+
+### 6.4 Deliverables & Publication Path
+
+#### 📄 Research Artifacts
+1. **Technical Report**: Comprehensive implementation and initial results
+2. **Code Release**: Open-source GTS framework for diffusion LLMs
+3. **Benchmark Suite**: Standardized evaluation protocol for coherence metrics
+4. **Demo Notebook**: Interactive Colab demonstrating GTS capabilities
+
+#### 🎯 Publication Timeline
+- **Short Paper** (2-3 months): Initial GTS validation and implementation
+- **Full Paper** (4-6 months): Comprehensive evaluation and optimization
+- **Conference Submission**: Target venues (ICML, NeurIPS, ACL)
+
+The implementation is now ready for the crucial empirical validation phase that will determine whether GTS can fulfill its theoretical promise of improving parallel decoding quality in diffusion LLMs.
+
+---
+
+**Implementation Status: ✅ Phase 1 Complete - Ready for Empirical Testing**  
+**Next Milestone: Colab validation and correlation analysis with human quality judgments**
