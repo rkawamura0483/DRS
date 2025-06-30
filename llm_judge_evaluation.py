@@ -23,7 +23,7 @@ except ImportError:
     print("pip install google-generativeai でインストールしてください")
     GEMINI_AVAILABLE = False
 
-from integrated_generation import generate_fast_long, load_model_with_scaling
+from integrated_generation import generate_fast_long, load_model_with_scaling, generate_no_cache
 
 
 class LLMJudge:
@@ -469,52 +469,60 @@ def compare_vanilla_vs_fast_dllm():
         input_ids = tokenizer(
             formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-        # 1. 標準的なLongLLaDA生成（Hugging Faceの標準実装）
+        # 1. 標準的なLongLLaDA生成（LongLLaDAの独自拡散生成）
         start_time = time.time()
         try:
-            with torch.no_grad():
-                vanilla_outputs = model.generate(
-                    input_ids,
-                    max_new_tokens=128,
-                    do_sample=True,  # サンプリング生成
-                    temperature=0.7,  # 適度な温度
-                    top_p=0.9,       # nucleus sampling
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,
-                    repetition_penalty=1.1  # 繰り返し防止
-                )
+            # integrated_generation.py内のgenerate_no_cache関数を使用（標準的な拡散生成）
+            from integrated_generation import generate_no_cache
+
+            # 標準拡散生成パラメータ（キャッシュなし）
+            vanilla_outputs = generate_no_cache(
+                model=model,
+                prompt=input_ids,
+                steps=32,  # 基本的なステップ数
+                gen_length=128,  # 生成長
+                block_length=128,  # 大きなブロック（標準的な設定）
+                temperature=0.0,  # 決定的生成
+                remasking='low_confidence',  # 信頼度ベースリマスキング
+                mask_id=126336,  # LongLLaDAのマスクトークンID
+                scaling_factor=1
+            )
             vanilla_time = time.time() - start_time
 
             # 生成部分のみを抽出し、適切にデコード
-            generated_tokens = vanilla_outputs[0, input_ids.shape[1]:]
             result_vanilla = tokenizer.decode(
-                generated_tokens, skip_special_tokens=True).strip()
-
-            # 空の場合は代替生成を試行
-            if not result_vanilla:
-                print("⚠️ 標準生成が空のため再試行中...")
-                vanilla_outputs = model.generate(
-                    input_ids,
-                    max_new_tokens=128,
-                    do_sample=False,  # greedy生成で再試行
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True
-                )
-                generated_tokens = vanilla_outputs[0, input_ids.shape[1]:]
-                result_vanilla = tokenizer.decode(
-                    generated_tokens, skip_special_tokens=True).strip()
+                vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
         except Exception as e:
-            print(f"⚠️ 標準生成エラー: {e}")
-            result_vanilla = f"生成エラー: {str(e)}"
-            vanilla_time = time.time() - start_time
-            vanilla_tokens = 0  # エラー時はトークン数0
+            print(f"⚠️ 標準LongLLaDA生成エラー: {e}")
+            print("🔄 フォールバック: より基本的なパラメータで再試行...")
+            try:
+                # より基本的なパラメータで再試行
+                vanilla_outputs = generate_no_cache(
+                    model=model,
+                    prompt=input_ids,
+                    steps=16,  # ステップ数削減
+                    gen_length=64,  # 生成長削減
+                    block_length=64,  # 小さなブロック
+                    temperature=0.1,  # 若干のランダム性
+                    remasking='random',  # ランダムマスキングに変更
+                    mask_id=126336,
+                    scaling_factor=1
+                )
+                vanilla_time = time.time() - start_time
+                result_vanilla = tokenizer.decode(
+                    vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+                print("✅ フォールバック生成成功")
+            except Exception as e2:
+                print(f"❌ フォールバック生成も失敗: {e2}")
+                result_vanilla = f"拡散生成エラー: {str(e2)}"
+                vanilla_time = time.time() - start_time
+                vanilla_tokens = 0  # エラー時はトークン数0
 
         outputs_vanilla.append(result_vanilla)
 
         # 標準生成のメトリクス
-        if 'vanilla_outputs' in locals():
+        if 'vanilla_outputs' in locals() and vanilla_outputs is not None:
             vanilla_tokens = vanilla_outputs.shape[1] - input_ids.shape[1]
         else:
             vanilla_tokens = 0  # エラー時はトークン数0
@@ -523,7 +531,7 @@ def compare_vanilla_vs_fast_dllm():
             "generation_time": vanilla_time,
             "tokens_generated": vanilla_tokens,
             "tokens_per_second": vanilla_tokens / vanilla_time if vanilla_time > 0 else 0,
-            "method": "standard_generation"
+            "method": "llada_diffusion_generation"
         })
 
         # 2. LongLLaDA + Fast-dLLM（拡散生成機構）
@@ -540,7 +548,7 @@ def compare_vanilla_vs_fast_dllm():
             )
 
             result_fast = tokenizer.decode(
-                outputs_fast_raw[0, input_ids.shape[1]:], skip_special_tokens=True
+                outputs_fast_raw[0, input_ids.shape[1]                                 :], skip_special_tokens=True
             ).strip()
 
             # Fast-dLLMのメトリクス
