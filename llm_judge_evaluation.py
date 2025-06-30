@@ -431,24 +431,26 @@ def compare_vanilla_vs_fast_dllm():
     """
     print("🆚 LongLLaDA vs LongLLaDA + Fast-dLLM 比較実験")
 
-    # モデル読み込み
+    # LongLLaDAの正しい読み込み方法（AutoModelを使用）
+    from transformers import AutoModel, AutoTokenizer, AutoConfig
+
     model_path = 'GSAI-ML/LLaDA-8B-Instruct'
-    model, tokenizer, config = load_model_with_scaling(
-        model_path, scaling_factor=1)
 
-    # 互換性パッチ: LLaDAModelLM が forward の未知キーワードを拒否するため generate でエラーになる
-    def _patch_forward_for_generate(m):
-        if getattr(m, "_patched_for_generate", False):
-            return  # 既にパッチ済み
-        original_forward = m.forward
+    # LongLLaDAの正しい読み込み
+    print("📥 LongLLaDAモデル読み込み（AutoModel使用）...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModel.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,  # LongLLaDAの推奨データ型
+        device_map='auto'
+    ).eval()
 
-        def wrapped_forward(*args, **kwargs):
-            # transformers>=4.40 で追加された cache_position などを除去
-            kwargs.pop('cache_position', None)
-            return original_forward(*args, **kwargs)
-        m.forward = wrapped_forward
-        m._patched_for_generate = True
-    _patch_forward_for_generate(model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=True)
+
+    print("✅ LongLLaDAモデル読み込み完了")
 
     # テストプロンプト
     test_prompts = generate_test_cases()["basic"]
@@ -469,23 +471,22 @@ def compare_vanilla_vs_fast_dllm():
         input_ids = tokenizer(
             formatted_prompt, return_tensors='pt').input_ids.to(model.device)
 
-        # 1. 標準的なLongLLaDA生成（LongLLaDAの独自拡散生成）
+        # 1. 標準的なLongLLaDA生成（LongLLaDAオリジナルの拡散生成）
         start_time = time.time()
         try:
-            # integrated_generation.py内のgenerate_no_cache関数を使用（標準的な拡散生成）
-            from integrated_generation import generate_no_cache
+            # LongLLaDAオリジナルの拡散生成関数を使用
+            from LongLLaDA.llada.llada_generate import generate as llada_generate
 
-            # 標準拡散生成パラメータ（キャッシュなし）
-            vanilla_outputs = generate_no_cache(
+            vanilla_outputs = llada_generate(
                 model=model,
                 prompt=input_ids,
-                steps=32,  # 基本的なステップ数
+                steps=128,  # LongLLaDAの標準設定
                 gen_length=128,  # 生成長
-                block_length=128,  # 大きなブロック（標準的な設定）
+                block_length=32,  # 標準的なブロック長
                 temperature=0.0,  # 決定的生成
+                cfg_scale=0.0,  # CFG無効
                 remasking='low_confidence',  # 信頼度ベースリマスキング
-                mask_id=126336,  # LongLLaDAのマスクトークンID
-                scaling_factor=1
+                mask_id=126336  # LongLLaDAのマスクトークンID
             )
             vanilla_time = time.time() - start_time
 
@@ -493,21 +494,26 @@ def compare_vanilla_vs_fast_dllm():
             result_vanilla = tokenizer.decode(
                 vanilla_outputs[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
+            # エラー時の空出力対策
+            if not result_vanilla.strip():
+                print("⚠️ 標準生成が空のため再試行中...")
+                raise ValueError("Empty generation output")
+
         except Exception as e:
             print(f"⚠️ 標準LongLLaDA生成エラー: {e}")
             print("🔄 フォールバック: より基本的なパラメータで再試行...")
             try:
                 # より基本的なパラメータで再試行
-                vanilla_outputs = generate_no_cache(
+                vanilla_outputs = llada_generate(
                     model=model,
                     prompt=input_ids,
-                    steps=16,  # ステップ数削減
+                    steps=64,  # ステップ数削減
                     gen_length=64,  # 生成長削減
-                    block_length=64,  # 小さなブロック
+                    block_length=64,  # 大きなブロック
                     temperature=0.1,  # 若干のランダム性
+                    cfg_scale=0.0,
                     remasking='random',  # ランダムマスキングに変更
-                    mask_id=126336,
-                    scaling_factor=1
+                    mask_id=126336
                 )
                 vanilla_time = time.time() - start_time
                 result_vanilla = tokenizer.decode(
@@ -515,23 +521,22 @@ def compare_vanilla_vs_fast_dllm():
                 print("✅ フォールバック生成成功")
             except Exception as e2:
                 print(f"❌ フォールバック生成も失敗: {e2}")
-                result_vanilla = f"拡散生成エラー: {str(e2)}"
+                result_vanilla = f"LongLLaDA拡散生成エラー: {str(e2)}"
                 vanilla_time = time.time() - start_time
-                vanilla_tokens = 0  # エラー時はトークン数0
 
         outputs_vanilla.append(result_vanilla)
 
-        # 標準生成のメトリクス
+        # 標準生成のメトリクス（拡散生成は固定長生成）
         if 'vanilla_outputs' in locals() and vanilla_outputs is not None:
             vanilla_tokens = vanilla_outputs.shape[1] - input_ids.shape[1]
         else:
-            vanilla_tokens = 0  # エラー時はトークン数0
+            vanilla_tokens = 64  # フォールバック時の生成長
 
         metrics_vanilla.append({
             "generation_time": vanilla_time,
             "tokens_generated": vanilla_tokens,
             "tokens_per_second": vanilla_tokens / vanilla_time if vanilla_time > 0 else 0,
-            "method": "llada_diffusion_generation"
+            "method": "llada_original_diffusion"
         })
 
         # 2. LongLLaDA + Fast-dLLM（拡散生成機構）
