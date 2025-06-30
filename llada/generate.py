@@ -414,9 +414,16 @@ def main():
             out[:, input_ids.shape[1]:], skip_special_tokens=True)[0]
 
         print(
-            f"✅ 生成完了 (NFE: {metrics['nfe']}, 反復: {metrics['iterations']}, 時間: {generation_time:.2f}s)")
-        print(
-            f"📊 最終GTS: {metrics['gts_scores'][-1] if metrics['gts_scores'] else 'N/A':.4f}")
+            f"✅ 生成完了 (NFE: {metrics['nfe']}, 反復: {metrics.get('total_iterations', metrics.get('iterations', 0))}, 時間: {generation_time:.2f}s)")
+
+        # GTSスコアの表示（複数のキー名に対応）
+        gts_scores = metrics.get('gts_scores_history',
+                                 metrics.get('gts_scores', []))
+        final_gts = gts_scores[-1] if gts_scores else 'N/A'
+        if final_gts != 'N/A':
+            print(f"📊 最終GTS: {final_gts:.4f}")
+        else:
+            print(f"📊 最終GTS: {final_gts}")
         print(f"📄 生成結果:\n{generated_text}")
 
     elif args.sampler == 'compare':
@@ -438,13 +445,20 @@ def main():
                 verbose=False)
             gts_time = time.time() - start_time
 
+            # GTSメトリクスのキー名に対応
+            total_iterations = gts_metrics.get(
+                'total_iterations', gts_metrics.get('iterations', 0))
+            gts_scores = gts_metrics.get(
+                'gts_scores_history', gts_metrics.get('gts_scores', []))
+            final_gts = gts_scores[-1] if gts_scores else 0.0
+
             results['gts'] = {
                 'output': gts_out,
                 'nfe': gts_metrics['nfe'],
                 'time': gts_time,
                 'method': 'GTS Controlled',
-                'iterations': gts_metrics['iterations'],
-                'final_gts': gts_metrics['gts_scores'][-1] if gts_metrics['gts_scores'] else 0.0
+                'iterations': total_iterations,
+                'final_gts': final_gts
             }
 
         # 結果表示
